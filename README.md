@@ -41,10 +41,10 @@ flowchart LR
     BFF["/api/chat<br/>BFF passthrough"]
   end
 
-  subgraph Hono["apps/api · Hono on Bun"]
+  subgraph Hono["apps/api · Hono on Node"]
     Chat["/chat route<br/>streamText + tools"]
     Tools["sandbox tools<br/>bash · read_file · write_file · list_dir"]
-    Provider["SandboxProvider<br/>kubectl shellout"]
+    Provider["SandboxProvider<br/>@kubernetes/client-node"]
   end
 
   subgraph GCP[Google Cloud]
@@ -61,7 +61,7 @@ flowchart LR
   Vertex -->|"tool calls"| Chat
   Chat --> Tools
   Tools --> Provider
-  Provider -->|"kubectl exec"| Pod
+  Provider -->|"k8s Exec API<br/>(WebSocket)"| Pod
   Pod -.->|"stdout/stderr/exit"| Provider
   Chat -->|"streamed UI parts"| BFF
   BFF -.->|"SSE-ish stream"| UI
@@ -69,7 +69,7 @@ flowchart LR
 
 Three independent processes on your Mac:
 
-- **`bun --watch src/index.ts`** (Hono on `:8787`) — owns the AI SDK call, tool dispatch, and `kubectl exec` into the sandbox.
+- **`tsx watch src/index.ts`** (Hono on `:8787`, **Node 22**) — owns the AI SDK call, tool dispatch, and direct k8s exec into the sandbox via `@kubernetes/client-node`.
 - **`vite dev`** (SvelteKit on `:5173`) — serves the chat UI and proxies `/api/chat` to the Hono server.
 - **`colima-harness` VM** — Linux + k3s + kata. Independent of the app processes; survives restarts.
 
@@ -79,17 +79,19 @@ Three independent processes on your Mac:
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Runtime + PM | **Bun 1.3.x** | Native TS, fast install, `Bun.spawn` for `kubectl` |
-| Monorepo | **Turbo** + Bun workspaces + **catalog** | matches opencode conventions |
-| Frontend | **SvelteKit 2** + **Svelte 5** runes + **Tailwind 4** | shadcn-svelte not yet — raw Tailwind for now |
+| api runtime | **Node 22** (TypeScript via `tsx`) | switched off Bun so `@kubernetes/client-node` works natively (Bun fetch can't apply client-cert TLS from kubeconfig) |
+| web runtime | **Bun** (vite dev) | unchanged — Vite is happy on Bun |
+| Package manager | **Bun workspaces + catalog** | one PM across both apps; matches opencode conventions |
+| Monorepo | **Turbo** | dev/build pipelines, env passthrough |
+| Frontend | **SvelteKit 2** + **Svelte 5** runes + **Tailwind 4** + **shadcn-svelte** + **bits-ui** | full design system |
 | Chat client | **`@ai-sdk/svelte`** `Chat` + `DefaultChatTransport` | UI message stream protocol |
-| API server | **Hono 4** | Bun.serve with `idleTimeout: 0` (tool calls can take >10s) |
-| LLM | **Vercel AI SDK 6** (`ai@6.0.168`) + **`@ai-sdk/google-vertex`** | Gemini 2.5 pro/flash via ADC |
+| API server | **Hono 4** + **`@hono/node-server`** | runs on Node's http; long streams just work |
+| LLM | **Vercel AI SDK 6** (`ai@6.0.185`) + **`@ai-sdk/google-vertex`** | Gemini 3.1 Pro / 2.5 series via ADC (location=global) |
+| k8s client | **`@kubernetes/client-node` 1.4** | direct SDK; pod CRUD via `CoreV1Api`, command exec via `Exec` over WebSocket |
 | Auth | **gcloud ADC** | `gcloud auth application-default login` |
 | Sandbox runtime | **kata-containers 3.13** w/ **cloud-hypervisor** | real micro-VM, not just a container |
 | Local k8s | **k3s** inside **Colima** w/ **vz + nested-virtualization** | Apple's Virtualization.framework on M3+ |
 | Container runtime | **containerd 2.2** (config schema **v3**) | Colima's external containerd, not k3s-embedded |
-| Sandbox client | **`kubectl` shellout via `Bun.spawn`** | k8s SDK's client cert auth doesn't work in Bun yet |
 | Style guide | inline over helper, no `else`, no `try/catch`, snake_case in Drizzle | see `AGENTS.md` |
 
 ---
@@ -101,7 +103,7 @@ harness/
 ├─ apps/
 │  ├─ api/                       Hono server, AI SDK, sandbox
 │  │  └─ src/
-│  │     ├─ index.ts             Bun.serve + Hono routes
+│  │     ├─ index.ts             @hono/node-server + Hono routes
 │  │     ├─ runtime.ts           Effect ManagedRuntime (empty until Phase D)
 │  │     ├─ ai/
 │  │     │  ├─ models.ts         Vertex provider registry
@@ -151,7 +153,7 @@ sequenceDiagram
   participant W as SvelteKit<br/>:5173
   participant A as Hono /chat<br/>:8787
   participant G as Vertex AI<br/>(Gemini)
-  participant K as kubectl
+  participant K as k8s API
   participant P as Pod<br/>(kata-clh)
 
   U->>W: types prompt, useChat POSTs<br/>{sessionId, model, messages}
@@ -161,11 +163,11 @@ sequenceDiagram
 
   G-->>A: tool-call: bash("python3 /tmp/x.py")
   A->>A: sandbox.bash(sessionId, cmd)
-  A->>K: spawn: kubectl exec ... -- bash -c wrapped
-  Note over K,P: first call: ensure ns + pod,<br/>wait for Ready
+  A->>K: Exec API (WebSocket)
+  Note over K,P: first call: ensure ns + pod,<br/>wait for Running
   K->>P: exec into shell container
-  P-->>K: stdout, stderr, exit
-  K-->>A: process result
+  P-->>K: stdout, stderr, V1Status
+  K-->>A: streams resolved, exit code parsed
   A-->>G: tool-result: {stdout, exit, truncated}
 
   G-->>A: text-delta: "The script ran..."
@@ -173,27 +175,31 @@ sequenceDiagram
   W-->>U: streaming render
 ```
 
-### Tool wrapping (`apps/api/src/sandbox/provider.ts`)
+### Provider internals (`apps/api/src/sandbox/provider.ts`)
 
-Each `bash` call is wrapped to capture the exit code through `kubectl exec`,
-since k8s exec only reports exit by terminating with a status — and Bun's stream
-handling on the k8s SDK side wasn't cooperating, so we shell out:
+Pod CRUD and exec all go through `@kubernetes/client-node` directly. One
+shared `Exec` instance opens a WebSocket per call; stdin / stdout / stderr are
+plain Node streams. Exit codes come from the API server's
+`V1Status.details.causes` field on close — no need to wrap the command in an
+echo-the-exit-code trick.
 
 ```ts
-const tag = randomUUID()
-const wrapped = `
-  set +e
-  { ${command}
-  } 2>&1
-  rc=$?
-  echo "::EXIT_${tag}::$rc::"
-  exit 0
-`
-// runs as: kubectl exec ... -- bash -lc "timeout N bash -c '<wrapped>'"
+const kc = new k8s.KubeConfig()
+kc.loadFromDefault()
+kc.setCurrentContext("colima-harness")
+
+const core    = kc.makeApiClient(k8s.CoreV1Api)
+const execApi = new k8s.Exec(kc)
+
+// command exec: streams stdin/out/err, resolves with exit code
+execApi.exec(NS, podName, "shell", cmd, outStream, errStream, stdinStream, false, (status) => {
+  // V1Status → resolve({ stdout, stderr, exit })
+})
 ```
 
-The unique tag means the user's command can print anything — we still find the
-real exit code at the tail.
+`bash`, `python`, `read_file`, `write_file`, `list_dir`, `search`, `edit_file`,
+`fetch_url`, `pip_install`, `apt_install`, `upload`, `download`, `attach` all
+compose this same exec primitive — no `kubectl` subprocess anywhere.
 
 ---
 
@@ -280,8 +286,8 @@ flowchart LR
   A -- "no" --> C[POST Pod spec<br/>runtimeClassName: kata-clh<br/>image: python:3.12-slim-bookworm<br/>command: sleep infinity]
   C --> W[wait condition=Ready<br/>--timeout=90s]
   A -- "yes, Running" --> E
-  W --> E[kubectl exec ... bash -c &lt;wrapped&gt;]
-  E --> O[stdout / stderr / exit<br/>parse ::EXIT_&lt;tag&gt;:: tail]
+  W --> E[Exec API · WebSocket<br/>bash -lc &lt;cmd&gt;]
+  E --> O[stdout / stderr / V1Status<br/>→ exit code]
   O --> R2[tool result back to model]
 ```
 
@@ -294,22 +300,30 @@ flowchart LR
   `kubectl --context colima-harness -n harness-sandboxes delete pods --all`.
 - Resource limits: `cpu: 2 / memory: 1Gi`. Adjust in `provider.ts`.
 
-### Why `kubectl` instead of `@kubernetes/client-node`
+### Why Node for the api, Bun for the web
 
-We started with the SDK. Two things broke under Bun:
+We started with both apps on Bun. The k8s SDK broke in two ways:
 
-1. `fetch` against `https://127.0.0.1:54910` failed with `SELF_SIGNED_CERT_IN_CHAIN`
-   because Bun's `fetch` doesn't apply custom CAs from a `https.Agent` the way
-   Node does.
-2. With `NODE_TLS_REJECT_UNAUTHORIZED=0`, requests get past TLS but the
-   kubeconfig's **client certificate** auth never reaches the wire — Bun's
-   `fetch` ignores agent-level `cert`/`key`. Result: 401 Unauthorized.
+1. `fetch` against `https://127.0.0.1:54910` failed with
+   `SELF_SIGNED_CERT_IN_CHAIN` because Bun's `fetch` doesn't pick up CAs from a
+   custom `https.Agent`.
+2. With `NODE_TLS_REJECT_UNAUTHORIZED=0`, requests got past TLS but the
+   kubeconfig's **client cert** never reached the wire — Bun's `fetch` ignored
+   agent-level `cert`/`key`. Result: 401.
 
-Shelling out to `kubectl` sidesteps both problems for ~200 ms of overhead per
-call. That overhead is dwarfed by Gemini round-trip times. When this matters
-(stream-heavy workloads, hundreds of exec calls per session) we'll either move
-the API process to plain Node *or* extract a `sandbox-runner` service that
-talks to k8s directly.
+Rather than shell out to `kubectl` (the original workaround), we run the api
+process on **Node** via `tsx` — Node's `https.Agent` applies the CA + client
+cert correctly, so the SDK works as designed. Bun stays as the package manager
+(workspaces, catalog) and as the web dev runtime. Roughly:
+
+```
+apps/api  →  Node 22 + tsx          (uses @kubernetes/client-node)
+apps/web  →  Bun + Vite             (frontend, no k8s interaction)
+pkg mgr   →  Bun                    (install/lockfile/catalog)
+```
+
+This split keeps Bun where it shines (fast installs, fast dev for the
+frontend) and puts the api on Node where the SDK ecosystem expects to be.
 
 ---
 
@@ -418,7 +432,7 @@ flowchart LR
   MODELS[ai/models.ts<br/>vertex registry]
   PROMPT[ai/system-prompt.ts]
   TOOLS[ai/tools.ts<br/>bash / read_file<br/>write_file / list_dir]
-  PROV[sandbox/provider.ts<br/>kubectl spawn]
+  PROV[sandbox/provider.ts<br/>@kubernetes/client-node]
 
   IDX --- HEALTH
   IDX --- CHAT
@@ -484,7 +498,7 @@ on Intel Macs or M1/M2.
 | Limitation | Why | Mitigation |
 |---|---|---|
 | No pod TTL / reaper | Out of scope for first cut | `kubectl -n harness-sandboxes delete pods --all` |
-| `kubectl` shellout ~200 ms/call overhead | Bun TLS + client cert | Migrate to Node or extract a sandbox-runner |
+| ~~`kubectl` shellout overhead~~ | resolved — apps/api runs on Node with `@kubernetes/client-node` direct exec | |
 | No persistence (chat history) | No DB yet | Phase D adds Drizzle + cortex sessions |
 | Tool output is JSON-dumped in UI | No per-tool renderer | Custom renderers when shadcn-svelte lands |
 | `setup.sh` not idempotent across kata-deploy v2-vs-v3 schema regressions | Each kata-deploy restart re-writes its drop-in (we don't use it, but it's noise) | Document; the symlink hack is in `infra/kata/README.md` |
@@ -536,7 +550,7 @@ See `AGENTS.md`. Quick highlights:
 If you want a one-paragraph mental model: this is a **streaming function** from
 chat messages to chat messages. SvelteKit's BFF and the Hono API just shuttle
 bytes; the model lives at Vertex and decides when to "step out" by emitting
-tool calls. Each tool call resolves to a `kubectl exec` into a long-lived pod
+tool calls. Each tool call resolves to a k8s `Exec` API call into a long-lived pod
 that the model owns for the duration of its session. The pod is a real
 isolated kernel running inside a real micro-VM running inside a Linux VM
 running inside macOS — five boundaries between the agent's `rm -rf /` and

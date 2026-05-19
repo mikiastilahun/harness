@@ -4,14 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --watch src/index.ts",
-    "start": "bun src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "ai": "catalog:",
     "@ai-sdk/google-vertex": "catalog:",
     "hono": "catalog:",
+    "@hono/node-server": "1.13.5",
     "hono-openapi": "catalog:",
     "@hono/zod-validator": "catalog:",
     "zod": "catalog:",
@@ -20,8 +21,8 @@
     "@kubernetes/client-node": "1.4.0"
   },
   "devDependencies": {
-    "@types/bun": "catalog:",
-    "@tsconfig/bun": "catalog:",
+    "@types/node": "catalog:",
+    "tsx": "4.19.2",
     "typescript": "catalog:"
   }
 }

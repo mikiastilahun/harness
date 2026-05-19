@@ -1,7 +1,5 @@
-import { randomUUID } from "node:crypto"
-import { unlink, mkdtemp } from "node:fs/promises"
-import { join } from "node:path"
-import { tmpdir } from "node:os"
+import * as k8s from "@kubernetes/client-node"
+import { Writable, Readable } from "node:stream"
 import { guessMime, isTextLike, isImage } from "./mime"
 
 const NS = process.env.KATA_NAMESPACE ?? "harness-sandboxes"
@@ -10,78 +8,94 @@ const RUNTIME_CLASS = process.env.KATA_RUNTIME_CLASS ?? "kata-clh"
 const IMAGE = process.env.SANDBOX_IMAGE ?? "harness-sandbox:1"
 const IMAGE_PULL_POLICY = process.env.SANDBOX_IMAGE_PULL_POLICY ?? "IfNotPresent"
 const CONTAINER = "shell"
-const KUBECTL = process.env.KUBECTL ?? "kubectl"
+const UPLOAD_DIR = "/workspace/uploads"
+const ALLOWED_ROOT = "/workspace"
+const MAX_BYTES = 256 * 1024
+
+const kc = new k8s.KubeConfig()
+kc.loadFromDefault()
+kc.setCurrentContext(CONTEXT)
+
+const core = kc.makeApiClient(k8s.CoreV1Api)
+const execApi = new k8s.Exec(kc)
 
 const ready = new Map<string, Promise<void>>()
 
 const podName = (sessionId: string) =>
   "harness-sb-" + sessionId.replace(/[^a-z0-9-]/gi, "").toLowerCase().slice(0, 40)
 
-const kctl = async (
-  args: string[],
-  opts: { stdin?: string; timeoutMs?: number } = {},
-): Promise<{ stdout: string; stderr: string; exit: number }> => {
-  const proc = Bun.spawn([KUBECTL, "--context", CONTEXT, ...args], {
-    stdin: opts.stdin ? new TextEncoder().encode(opts.stdin) : "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  })
-  const timer = opts.timeoutMs ? setTimeout(() => proc.kill(), opts.timeoutMs) : null
-  const [stdout, stderr, exit] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ])
-  if (timer) clearTimeout(timer)
-  return { stdout, stderr, exit }
+const sanitizeFilename = (name: string) => {
+  const base = name.split("/").pop() ?? "file"
+  const cleaned = base.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 200)
+  return cleaned || "file"
 }
 
-const podSpec = (sessionId: string) =>
-  JSON.stringify({
-    apiVersion: "v1",
-    kind: "Pod",
-    metadata: {
-      name: podName(sessionId),
-      namespace: NS,
-      labels: { "app.kubernetes.io/name": "harness-sandbox", "harness.io/session": sessionId },
-    },
-    spec: {
-      runtimeClassName: RUNTIME_CLASS,
-      restartPolicy: "Never",
-      terminationGracePeriodSeconds: 5,
-      containers: [
-        {
-          name: CONTAINER,
-          image: IMAGE,
-          imagePullPolicy: IMAGE_PULL_POLICY,
-          command: ["/bin/sh", "-c", "sleep infinity"],
-          workingDir: "/workspace",
-          resources: {
-            limits: { cpu: "2", memory: "2Gi" },
-            requests: { cpu: "200m", memory: "512Mi" },
-          },
-        },
-      ],
-    },
-  })
+const shellQuote = (s: string) => "'" + s.replace(/'/g, `'\\''`) + "'"
+
+const truncate = (s: string) =>
+  s.length > MAX_BYTES
+    ? { text: s.slice(0, MAX_BYTES) + "\n[truncated]", truncated: true }
+    : { text: s, truncated: false }
+
+const isStatus404 = (e: unknown) => {
+  const err = e as { code?: number; statusCode?: number; body?: { code?: number } }
+  return err?.code === 404 || err?.statusCode === 404 || err?.body?.code === 404
+}
 
 const ensureNamespace = async () => {
-  const r = await kctl(["get", "namespace", NS, "-o", "name"])
-  if (r.exit === 0) return
-  const c = await kctl(["create", "namespace", NS])
-  if (c.exit !== 0 && !c.stderr.includes("already exists")) throw new Error(`create ns: ${c.stderr}`)
+  try {
+    await core.readNamespace({ name: NS })
+  } catch (e) {
+    if (!isStatus404(e)) throw e
+    await core.createNamespace({ body: { metadata: { name: NS } } })
+  }
 }
+
+const podSpec = (sessionId: string): k8s.V1Pod => ({
+  apiVersion: "v1",
+  kind: "Pod",
+  metadata: {
+    name: podName(sessionId),
+    namespace: NS,
+    labels: { "app.kubernetes.io/name": "harness-sandbox", "harness.io/session": sessionId },
+  },
+  spec: {
+    runtimeClassName: RUNTIME_CLASS,
+    restartPolicy: "Never",
+    terminationGracePeriodSeconds: 5,
+    containers: [
+      {
+        name: CONTAINER,
+        image: IMAGE,
+        imagePullPolicy: IMAGE_PULL_POLICY,
+        command: ["/bin/sh", "-c", "sleep infinity"],
+        workingDir: "/workspace",
+        resources: {
+          limits: { cpu: "2", memory: "2Gi" },
+          requests: { cpu: "200m", memory: "512Mi" },
+        },
+      },
+    ],
+  },
+})
 
 const ensurePod = async (sessionId: string) => {
   const name = podName(sessionId)
-  const got = await kctl(["-n", NS, "get", "pod", name, "-o", "jsonpath={.status.phase}"])
-  if (got.exit === 0 && got.stdout === "Running") return
-  if (got.exit !== 0) {
-    const apply = await kctl(["apply", "-f", "-"], { stdin: podSpec(sessionId) })
-    if (apply.exit !== 0) throw new Error(`apply pod: ${apply.stderr}`)
+  try {
+    const pod = await core.readNamespacedPod({ name, namespace: NS })
+    if (pod.status?.phase === "Running") return
+  } catch (e) {
+    if (!isStatus404(e)) throw e
+    await core.createNamespacedPod({ namespace: NS, body: podSpec(sessionId) })
   }
-  const wait = await kctl(["-n", NS, "wait", `--for=condition=Ready`, `pod/${name}`, "--timeout=90s"])
-  if (wait.exit !== 0) throw new Error(`wait pod: ${wait.stderr || wait.stdout}`)
+  const deadline = Date.now() + 90_000
+  while (Date.now() < deadline) {
+    const pod = await core.readNamespacedPod({ name, namespace: NS })
+    if (pod.status?.phase === "Running") return
+    if (pod.status?.phase === "Failed") throw new Error(`pod failed: ${pod.status?.message ?? ""}`)
+    await new Promise((r) => setTimeout(r, 500))
+  }
+  throw new Error("sandbox pod did not become Running within 90s")
 }
 
 const acquire = async (sessionId: string) => {
@@ -100,41 +114,60 @@ const acquire = async (sessionId: string) => {
   }
 }
 
-type ExecResult = { stdout: string; stderr: string; exit: number; truncated: boolean }
+type RawResult = { stdout: string; stderr: string; status: "Success" | "Failure"; exitCode: number }
 
-const MAX_BYTES = 256 * 1024
-
-const truncate = (s: string) =>
-  s.length > MAX_BYTES ? { text: s.slice(0, MAX_BYTES) + "\n[truncated]", truncated: true } : { text: s, truncated: false }
+const exitCodeFromStatus = (status: k8s.V1Status | undefined): number => {
+  if (!status) return 0
+  if (status.status === "Success") return 0
+  const cause = status.details?.causes?.find((c) => c.reason === "ExitCode")
+  if (cause?.message) {
+    const n = Number(cause.message)
+    if (!Number.isNaN(n)) return n
+  }
+  return 1
+}
 
 const rawExec = async (
   sessionId: string,
   command: string[],
-  stdin?: string,
-  timeoutMs?: number,
-) => {
+  stdin?: string | Uint8Array,
+): Promise<RawResult> => {
   await acquire(sessionId)
-  const args = ["-n", NS, "exec", podName(sessionId), "-c", CONTAINER]
-  if (stdin !== undefined) args.push("-i")
-  args.push("--", ...command)
-  return kctl(args, { stdin, timeoutMs })
+  const stdoutChunks: Buffer[] = []
+  const stderrChunks: Buffer[] = []
+  const out = new Writable({
+    write(chunk, _enc, cb) {
+      stdoutChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      cb()
+    },
+  })
+  const err = new Writable({
+    write(chunk, _enc, cb) {
+      stderrChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      cb()
+    },
+  })
+  const stdinStream = stdin
+    ? Readable.from([typeof stdin === "string" ? Buffer.from(stdin, "utf8") : Buffer.from(stdin)])
+    : null
+  return new Promise<RawResult>((resolve, reject) => {
+    execApi
+      .exec(NS, podName(sessionId), CONTAINER, command, out, err, stdinStream, false, (status) => {
+        resolve({
+          stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+          stderr: Buffer.concat(stderrChunks).toString("utf8"),
+          status: (status?.status as "Success" | "Failure") ?? "Success",
+          exitCode: exitCodeFromStatus(status),
+        })
+      })
+      .catch(reject)
+  })
 }
 
-export const bash = async (sessionId: string, command: string, timeout = 60): Promise<ExecResult> => {
-  const tag = randomUUID()
-  const wrapped = `set +e\n{ ${command}\n} 2>&1\nrc=$?\necho "::EXIT_${tag}::$rc::"\nexit 0`
-  const result = await rawExec(
-    sessionId,
-    ["/bin/bash", "-lc", `timeout ${timeout} bash -c ${shellQuote(wrapped)}`],
-    undefined,
-    (timeout + 10) * 1000,
-  )
-  const combined = result.stdout
-  const m = combined.match(new RegExp(`::EXIT_${tag}::(-?\\d+)::`))
-  const exit = m ? Number(m[1]) : result.exit
-  const cleaned = m ? combined.replace(m[0], "").replace(/\s+$/, "") : combined
-  const t = truncate(cleaned)
-  return { stdout: t.text, stderr: result.stderr, exit, truncated: t.truncated }
+export const bash = async (sessionId: string, command: string, timeout = 60) => {
+  const r = await rawExec(sessionId, ["/bin/bash", "-lc", `timeout ${timeout} bash -c ${shellQuote(command)} 2>&1`])
+  const t = truncate(r.stdout)
+  return { stdout: t.text, stderr: r.stderr, exit: r.exitCode, truncated: t.truncated }
 }
 
 export const readFile = async (sessionId: string, path: string) => {
@@ -148,7 +181,7 @@ export const writeFile = async (sessionId: string, path: string, content: string
     ["/bin/sh", "-c", `mkdir -p "$(dirname ${shellQuote(path)})" && cat > ${shellQuote(path)}`],
     content,
   )
-  if (r.exit !== 0) throw new Error(`writeFile: ${r.stderr}`)
+  if (r.status !== "Success") throw new Error(`writeFile: ${r.stderr || r.stdout}`)
 }
 
 export const listDir = async (sessionId: string, path: string) => {
@@ -176,19 +209,20 @@ p.write_text(text.replace(find, replace, 1))
 print(f"OK: 1 occurrence replaced in {p}")
 `
   const r = await rawExec(sessionId, ["/usr/local/bin/python3", "-c", code])
-  return { ok: r.exit === 0, output: r.exit === 0 ? r.stdout.trim() : r.stderr.trim(), exit: r.exit }
+  const ok = r.status === "Success"
+  return { ok, output: ok ? r.stdout.trim() : r.stderr.trim(), exit: r.exitCode }
 }
 
 export const search = async (sessionId: string, pattern: string, path = "/workspace", glob?: string) => {
   const args = ["rg", "-n", "--no-heading", "--max-count=200", "-S"]
   if (glob) args.push("-g", glob)
   args.push("--", pattern, path)
-  const r = await rawExec(sessionId, args, undefined, 30000)
+  const r = await rawExec(sessionId, args)
   const t = truncate(r.stdout)
-  return { output: t.text, exit: r.exit, truncated: t.truncated }
+  return { output: t.text, exit: r.exitCode, truncated: t.truncated }
 }
 
-export const python = async (sessionId: string, code: string, timeout = 60): Promise<ExecResult> => {
+export const python = async (sessionId: string, code: string, timeout = 60) => {
   const codeB64 = Buffer.from(code).toString("base64")
   const cmd = `echo ${codeB64} | base64 -d | python3 -`
   return bash(sessionId, cmd, timeout)
@@ -198,10 +232,9 @@ export const fetchUrl = async (sessionId: string, url: string, timeout = 30) => 
   if (!/^https?:\/\//i.test(url)) return { status: 0, body: "", error: "url must be http(s)://", truncated: false }
   const cmd = `curl -sS -L --max-time ${timeout} -o /tmp/.fetch_body -w "%{http_code}" ${shellQuote(url)} && head -c 262144 /tmp/.fetch_body && echo`
   const r = await bash(sessionId, cmd, timeout + 10)
-  const tail = r.stdout
-  const m = tail.match(/^(\d{3})/)
+  const m = r.stdout.match(/^(\d{3})/)
   const status = m ? Number(m[1]) : 0
-  const body = m ? tail.slice(m[0].length) : tail
+  const body = m ? r.stdout.slice(m[0].length) : r.stdout
   return { status, body, truncated: r.truncated, exit: r.exit }
 }
 
@@ -220,34 +253,17 @@ export const aptInstall = async (sessionId: string, packages: string[]) => {
   return { ok: r.exit === 0, output: (r.stdout + r.stderr).trim().slice(0, 8192), exit: r.exit }
 }
 
-const UPLOAD_DIR = "/workspace/uploads"
-const ALLOWED_ROOT = "/workspace"
-
-const sanitizeFilename = (name: string) => {
-  const base = name.split("/").pop() ?? "file"
-  const cleaned = base.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 200)
-  return cleaned || "file"
-}
-
 export const uploadFile = async (
   sessionId: string,
   filename: string,
   bytes: Uint8Array,
 ): Promise<{ path: string; name: string; size: number; mime: string }> => {
   await acquire(sessionId)
-  await rawExec(sessionId, ["mkdir", "-p", UPLOAD_DIR])
   const safe = sanitizeFilename(filename)
   const dest = `${UPLOAD_DIR}/${safe}`
-
-  const tmpRoot = await mkdtemp(join(tmpdir(), "harness-up-"))
-  const tmp = join(tmpRoot, safe)
-  await Bun.write(tmp, bytes)
-  try {
-    const r = await kctl(["-n", NS, "cp", "-c", CONTAINER, tmp, `${podName(sessionId)}:${dest}`])
-    if (r.exit !== 0) throw new Error(`kubectl cp failed: ${r.stderr || r.stdout}`)
-  } finally {
-    await unlink(tmp).catch(() => {})
-  }
+  await rawExec(sessionId, ["mkdir", "-p", UPLOAD_DIR])
+  const r = await rawExec(sessionId, ["/bin/sh", "-c", `cat > ${shellQuote(dest)}`], bytes)
+  if (r.status !== "Success") throw new Error(`upload failed: ${r.stderr || r.stdout}`)
   return { path: dest, name: safe, size: bytes.length, mime: guessMime(dest) }
 }
 
@@ -259,15 +275,34 @@ export const downloadFile = async (
     throw new Error("path must be under /workspace")
   }
   await acquire(sessionId)
-  const statR = await rawExec(sessionId, ["stat", "-c", "%s", path])
-  if (statR.exit !== 0) throw new Error(`file not found: ${path}`)
-  const size = Number(statR.stdout.trim()) || 0
+  const stat = await rawExec(sessionId, ["stat", "-c", "%s", path])
+  if (stat.status !== "Success") throw new Error(`file not found: ${path}`)
+  const size = Number(stat.stdout.trim()) || 0
   const name = path.split("/").pop() ?? "file"
-  const proc = Bun.spawn(
-    [KUBECTL, "--context", CONTEXT, "-n", NS, "exec", podName(sessionId), "-c", CONTAINER, "--", "cat", path],
-    { stdout: "pipe", stderr: "ignore" },
-  )
-  return { stream: proc.stdout as unknown as ReadableStream<Uint8Array>, mime: guessMime(path), size, name }
+  const mime = guessMime(path)
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const out = new Writable({
+        write(chunk, _enc, cb) {
+          controller.enqueue(Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : new Uint8Array(Buffer.from(chunk)))
+          cb()
+        },
+      })
+      const err = new Writable({
+        write(_chunk, _enc, cb) {
+          cb()
+        },
+      })
+      execApi
+        .exec(NS, podName(sessionId), CONTAINER, ["/bin/cat", path], out, err, null, false, (status) => {
+          if (status && status.status !== "Success") controller.error(new Error(status.message ?? "download failed"))
+          else controller.close()
+        })
+        .catch((e) => controller.error(e))
+    },
+  })
+  return { stream, mime, size, name }
 }
 
 const MAX_INLINE_TEXT = 256 * 1024
@@ -287,9 +322,9 @@ export const attachFile = async (
 }> => {
   if (!path.startsWith(`${ALLOWED_ROOT}/`)) throw new Error("path must be under /workspace")
   await acquire(sessionId)
-  const statR = await rawExec(sessionId, ["stat", "-c", "%s", path])
-  if (statR.exit !== 0) throw new Error(`file not found: ${path}`)
-  const size = Number(statR.stdout.trim()) || 0
+  const stat = await rawExec(sessionId, ["stat", "-c", "%s", path])
+  if (stat.status !== "Success") throw new Error(`file not found: ${path}`)
+  const size = Number(stat.stdout.trim()) || 0
   const name = path.split("/").pop() ?? "file"
   const mime = guessMime(path)
   const downloadUrl = `/api/sandbox/file?sessionId=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`
@@ -306,8 +341,10 @@ export const attachFile = async (
 }
 
 export const release = async (sessionId: string) => {
-  await kctl(["-n", NS, "delete", "pod", podName(sessionId), "--wait=false", "--ignore-not-found"])
+  try {
+    await core.deleteNamespacedPod({ name: podName(sessionId), namespace: NS })
+  } catch (e) {
+    if (!isStatus404(e)) throw e
+  }
   ready.delete(sessionId)
 }
-
-const shellQuote = (s: string) => "'" + s.replace(/'/g, `'\\''`) + "'"
