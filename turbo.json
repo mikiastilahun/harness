@@ -1,0 +1,31 @@
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "globalPassThroughEnv": [
+    "GOOGLE_VERTEX_PROJECT",
+    "GOOGLE_VERTEX_LOCATION",
+    "GOOGLE_CLOUD_PROJECT",
+    "GOOGLE_CLOUD_LOCATION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "API_URL",
+    "API_PORT",
+    "KATA_CONTEXT",
+    "KATA_NAMESPACE",
+    "KATA_RUNTIME_CLASS",
+    "SANDBOX_IMAGE",
+    "KUBECTL",
+    "NODE_TLS_REJECT_UNAUTHORIZED"
+  ],
+  "tasks": {
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", ".svelte-kit/**", "build/**"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    }
+  }
+}

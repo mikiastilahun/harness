@@ -1,0 +1,27 @@
+{
+  "name": "@harness/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ai": "catalog:",
+    "@ai-sdk/google-vertex": "catalog:",
+    "hono": "catalog:",
+    "hono-openapi": "catalog:",
+    "@hono/zod-validator": "catalog:",
+    "zod": "catalog:",
+    "effect": "catalog:",
+    "@effect/platform": "catalog:",
+    "@kubernetes/client-node": "1.4.0"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "@tsconfig/bun": "catalog:",
+    "typescript": "catalog:"
+  }
+}
