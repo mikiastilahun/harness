@@ -61,7 +61,7 @@
         >
           <div class="min-w-0 flex-1">
             <div class="truncate text-[13px] leading-tight">{t.title || "Untitled"}</div>
-            <div class="mt-0.5 text-[10px] text-muted-foreground">{formatTime(t.updatedAt)}</div>
+            <div class="mt-0.5 text-[10px] text-muted-foreground">{formatTime(t.updated_at)}</div>
           </div>
           <button
             type="button"
@@ -79,7 +79,4 @@
     </div>
   </ScrollArea>
 
-  <div class="border-t border-border px-3 py-2 text-[10px] text-muted-foreground">
-    sandbox · kata · vertex
-  </div>
 </aside>

@@ -12,17 +12,35 @@ through nested virtualization.
 
 ```sh
 # one-time
-./infra/kata/setup.sh                                  # ~10 min
+./infra/kata/setup.sh                                  # ~10 min, provisions colima + kata
 gcloud auth application-default login                   # ADC for Vertex
-cp .env.example .env                                    # adjust GCP project if needed
-bun install
+cp .env.example .env                                    # adjust GCP project, fill BETTER_AUTH_SECRET + GOOGLE_CLIENT_ID/SECRET
+pnpm install
+pnpm db:up                                              # start postgres (docker)
+pnpm db:migrate                                         # apply drizzle migrations
+
+# every-boot (colima resets /etc/containerd/config.toml on stop/start —
+# sandbox:up re-applies the kata stanzas and restarts containerd if needed)
+pnpm sandbox:up                                         # ~30s on a cold boot, instant if already running
 
 # run
-GOOGLE_VERTEX_PROJECT=qa1-us-central1-vpc-63b3e2 \
-KATA_CONTEXT=colima-harness \
-bun dev
-# → http://localhost:5173
+pnpm dev
+# → http://localhost:5173 (sign in with Google)
 ```
+
+### Auth setup (one-time)
+
+1. Generate a session secret and put it in `.env` as `BETTER_AUTH_SECRET`:
+   ```sh
+   openssl rand -base64 32
+   ```
+2. Create an OAuth client in **Google Cloud Console → APIs & Services → Credentials**:
+   - Application type: **Web application**
+   - Authorized redirect URI: `http://localhost:8787/auth/callback/google`
+   - Copy the client ID/secret into `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
+3. Postgres runs locally via `bun db:up` (see `infra/docker-compose.yml`). The default
+   `DATABASE_URL=postgres://harness:harness@localhost:5432/harness` matches it.
+4. `bun db:migrate` applies the drizzle migrations in `apps/api/drizzle/`.
 
 Try: *"Use your bash tool to write a Python script that lists the first 20 primes,
 save it as /tmp/primes.py, run it, and show me the output."*
@@ -38,13 +56,18 @@ flowchart LR
   end
 
   subgraph SvelteKit["apps/web · SvelteKit 2"]
-    BFF["/api/chat<br/>BFF passthrough"]
+    Pages["pages: /signin, /chat<br/>better-auth/svelte client"]
   end
 
   subgraph Hono["apps/api · Hono on Node"]
-    Chat["/chat route<br/>streamText + tools"]
+    Auth["/auth/*<br/>better-auth handler<br/>Google OAuth"]
+    Chat["/chat route<br/>streamText + tools<br/>(session-gated)"]
     Tools["sandbox tools<br/>bash · read_file · write_file · list_dir"]
     Provider["SandboxProvider<br/>@kubernetes/client-node"]
+  end
+
+  subgraph Postgres["postgres (docker)"]
+    DB[(better-auth tables<br/>user · session · account · verification)]
   end
 
   subgraph GCP[Google Cloud]
@@ -55,16 +78,17 @@ flowchart LR
     Pod["kata-clh pod per session<br/>python:3.12-slim-bookworm<br/>guest kernel 6.12"]
   end
 
-  UI -->|"POST /api/chat<br/>UI message stream"| BFF
-  BFF -->|"proxy<br/>x-harness-org"| Chat
+  UI -->|"cross-origin fetch<br/>credentials: include"| Chat
+  UI -->|"sign in"| Auth
+  Auth --> DB
+  Chat -->|"getSession"| Auth
   Chat -->|"AI SDK streamText"| Vertex
   Vertex -->|"tool calls"| Chat
   Chat --> Tools
   Tools --> Provider
   Provider -->|"k8s Exec API<br/>(WebSocket)"| Pod
   Pod -.->|"stdout/stderr/exit"| Provider
-  Chat -->|"streamed UI parts"| BFF
-  BFF -.->|"SSE-ish stream"| UI
+  Chat -.->|"streamed UI parts"| UI
 ```
 
 Three independent processes on your Mac:
@@ -88,7 +112,9 @@ Three independent processes on your Mac:
 | API server | **Hono 4** + **`@hono/node-server`** | runs on Node's http; long streams just work |
 | LLM | **Vercel AI SDK 6** (`ai@6.0.185`) + **`@ai-sdk/google-vertex`** | Gemini 3.1 Pro / 2.5 series via ADC (location=global) |
 | k8s client | **`@kubernetes/client-node` 1.4** | direct SDK; pod CRUD via `CoreV1Api`, command exec via `Exec` over WebSocket |
-| Auth | **gcloud ADC** | `gcloud auth application-default login` |
+| Vertex auth | **gcloud ADC** | `gcloud auth application-default login` |
+| User auth | **better-auth** (Google OAuth) | session cookie set by API; web calls API cross-origin with `credentials: include` |
+| Database | **Postgres 17** (docker locally) | runs via `infra/docker-compose.yml`; schema via **drizzle-orm** + **drizzle-kit** |
 | Sandbox runtime | **kata-containers 3.13** w/ **cloud-hypervisor** | real micro-VM, not just a container |
 | Local k8s | **k3s** inside **Colima** w/ **vz + nested-virtualization** | Apple's Virtualization.framework on M3+ |
 | Container runtime | **containerd 2.2** (config schema **v3**) | Colima's external containerd, not k3s-embedded |
@@ -101,10 +127,18 @@ Three independent processes on your Mac:
 ```
 harness/
 ├─ apps/
-│  ├─ api/                       Hono server, AI SDK, sandbox
+│  ├─ api/                       Hono server, AI SDK, sandbox, auth
+│  │  ├─ drizzle/                generated SQL migrations
+│  │  ├─ drizzle.config.ts       drizzle-kit config
 │  │  └─ src/
-│  │     ├─ index.ts             @hono/node-server + Hono routes
+│  │     ├─ index.ts             @hono/node-server + Hono routes + /auth/*
+│  │     ├─ auth.ts              better-auth instance (Google OAuth)
 │  │     ├─ runtime.ts           Effect ManagedRuntime (empty until Phase D)
+│  │     ├─ db/
+│  │     │  ├─ index.ts          pg Pool + drizzle client
+│  │     │  └─ schema.ts         better-auth tables (user/session/account/verification)
+│  │     ├─ middleware/
+│  │     │  └─ require-auth.ts   session gate for /chat, /sandbox
 │  │     ├─ ai/
 │  │     │  ├─ models.ts         Vertex provider registry
 │  │     │  ├─ system-prompt.ts  base prompt + sandbox doc
@@ -120,14 +154,18 @@ harness/
 │     └─ src/
 │        ├─ app.css              tailwind 4 import
 │        ├─ app.html             shell
+│        ├─ lib/
+│        │  ├─ api.ts            PUBLIC_API_URL helper
+│        │  └─ auth-client.ts    better-auth/svelte client
 │        ├─ routes/
 │        │  ├─ +layout.svelte    css import
 │        │  ├─ +page.server.ts   307 → /chat
-│        │  ├─ chat/+page.svelte chat UI (model picker, tool render)
-│        │  └─ api/chat/+server.ts   BFF passthrough
+│        │  ├─ signin/+page.svelte    Google sign-in
+│        │  └─ chat/+page.svelte chat UI (model picker, tool render)
 │        └─ ...
 │
 ├─ infra/
+│  ├─ docker-compose.yml         postgres for local dev
 │  └─ kata/
 │     ├─ setup.sh                one-shot provisioner
 │     ├─ containerd-config.toml  v3 schema with kata runtimes

@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "@ai-sdk/svelte": "catalog:",
+    "@harness/shared": "workspace:*",
     "ai": "catalog:",
+    "better-auth": "1.6.11",
     "bits-ui": "2.18.1",
     "clsx": "2.1.1",
     "dompurify": "catalog:",

@@ -1,11 +1,13 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte"
+  import { goto } from "$app/navigation"
   import type { UIMessage } from "ai"
   import { Chat } from "@ai-sdk/svelte"
   import { DefaultChatTransport } from "ai"
   import { Badge } from "$lib/components/ui/badge"
+  import { Button } from "$lib/components/ui/button"
   import { ScrollArea } from "$lib/components/ui/scroll-area"
-  import * as Select from "$lib/components/ui/select"
+  import ModelPicker from "$lib/components/chat/ModelPicker.svelte"
   import { Toaster } from "$lib/components/ui/sonner"
   import { toast } from "svelte-sonner"
   import Sidebar from "$lib/components/chat/Sidebar.svelte"
@@ -15,45 +17,40 @@
   import Composer from "$lib/components/chat/Composer.svelte"
   import Sparkles from "@lucide/svelte/icons/sparkles"
   import User from "@lucide/svelte/icons/user"
+  import LogOut from "@lucide/svelte/icons/log-out"
   import Loader from "@lucide/svelte/icons/loader-circle"
+  import Sun from "@lucide/svelte/icons/sun"
+  import Moon from "@lucide/svelte/icons/moon"
+  import SettingsIcon from "@lucide/svelte/icons/settings"
+  import { mode, toggleMode } from "mode-watcher"
+  import { signOut, useSession } from "$lib/auth-client"
   import {
     type Thread,
-    loadIndex,
-    loadMessages,
-    saveMessages,
-    deleteThread as deleteThreadStorage,
-    upsertThread,
-    newThread,
+    listThreads,
+    createThread,
+    getThread,
+    updateThread,
+    deleteThread,
     titleFromMessages,
   } from "$lib/threads"
+  import { defaultModelFor, parseModel } from "$lib/models"
+  import { getSettings, isConfigured, type Settings } from "$lib/settings"
 
-  type ModelId =
-    | "gemini-3.1-pro-preview"
-    | "gemini-3-flash-preview"
-    | "gemini-3.1-flash-lite"
-    | "gemini-2.5-pro"
-    | "gemini-2.5-flash"
-
-  const MODEL_OPTIONS: { value: ModelId; label: string; tier: "preview" | "ga" }[] = [
-    { value: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", tier: "preview" },
-    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash", tier: "preview" },
-    { value: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite", tier: "ga" },
-    { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro", tier: "ga" },
-    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash", tier: "ga" },
-  ]
-
-  const DEFAULT_MODEL: ModelId = "gemini-3.1-pro-preview"
+  const SAVE_DEBOUNCE_MS = 1500
 
   let threads = $state<Thread[]>([])
   let activeId = $state<string | null>(null)
   let chat = $state<Chat | null>(null)
   let viewportRef = $state<HTMLElement | null>(null)
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null
+  let pendingThreadId: string | null = null
+  let pendingMessages: UIMessage[] | null = null
+  let settings = $state<Settings | null>(null)
 
   const active = $derived(threads.find((t) => t.id === activeId) ?? null)
   const isBusy = $derived(chat?.status === "submitted" || chat?.status === "streaming")
-  const currentModel = $derived<ModelId>((active?.model as ModelId) ?? DEFAULT_MODEL)
-  const currentModelLabel = $derived(
-    MODEL_OPTIONS.find((o) => o.value === currentModel)?.label ?? currentModel,
+  const currentModel = $derived<string>(
+    active?.model ?? (settings?.provider ? defaultModelFor(settings.provider) : ""),
   )
 
   const makeChat = (t: Thread, initial: UIMessage[]) =>
@@ -61,62 +58,150 @@
       messages: initial,
       transport: new DefaultChatTransport({
         api: "/api/chat",
-        body: () => ({ model: t.model, sessionId: t.sessionId }),
+        body: () => ({ model: t.model, sessionId: t.sandbox_session_id }),
       }),
       onError: (e) => toast.error(e.message),
     })
 
-  const setActive = (t: Thread) => {
-    activeId = t.id
-    chat = makeChat(t, loadMessages(t.id))
-  }
-
-  const startNew = () => {
-    const t = newThread(DEFAULT_MODEL)
-    upsertThread(t)
-    threads = [t, ...threads]
-    setActive(t)
-  }
-
-  const removeThread = (id: string) => {
-    deleteThreadStorage(id)
-    threads = threads.filter((t) => t.id !== id)
-    if (activeId === id) {
-      if (threads.length > 0) setActive(threads[0]!)
-      else startNew()
+  const flushSave = async () => {
+    if (pendingTimer) {
+      clearTimeout(pendingTimer)
+      pendingTimer = null
+    }
+    if (!pendingThreadId || !pendingMessages) return
+    const id = pendingThreadId
+    const messages = pendingMessages
+    pendingThreadId = null
+    pendingMessages = null
+    const t = threads.find((x) => x.id === id)
+    const title = (t && titleFromMessages(messages)) ?? t?.title ?? "New chat"
+    try {
+      const updated = await updateThread(id, { title, messages })
+      threads = threads
+        .map((x) => (x.id === updated.id ? { ...x, title: updated.title, updated_at: updated.updated_at } : x))
+        .sort((a, b) => b.updated_at - a.updated_at)
+    } catch (e) {
+      toast.error(`Save failed: ${(e as Error).message}`)
     }
   }
 
-  const changeModel = (m: ModelId) => {
-    if (!active) return
-    const updated: Thread = { ...active, model: m, updatedAt: Date.now() }
-    upsertThread(updated)
-    threads = threads.map((t) => (t.id === updated.id ? updated : t)).sort((a, b) => b.updatedAt - a.updatedAt)
-    if (chat) chat = makeChat(updated, chat.messages)
+  const schedulePersist = (id: string, messages: UIMessage[]) => {
+    pendingThreadId = id
+    pendingMessages = messages
+    if (pendingTimer) clearTimeout(pendingTimer)
+    pendingTimer = setTimeout(() => {
+      pendingTimer = null
+      flushSave()
+    }, SAVE_DEBOUNCE_MS)
   }
 
-  onMount(() => {
-    threads = loadIndex()
-    if (threads.length === 0) startNew()
-    else setActive(threads[0]!)
+  const setActive = async (t: Thread) => {
+    if (activeId && activeId !== t.id) await flushSave()
+    activeId = t.id
+    const full = await getThread(t.id)
+    let effective: Thread = t
+    if (!parseModel(t.model) && settings?.provider) {
+      const migratedModel = defaultModelFor(settings.provider)
+      const updated = await updateThread(t.id, { model: migratedModel })
+      effective = { ...t, model: updated.model, updated_at: updated.updated_at }
+      threads = threads.map((x) => (x.id === effective.id ? effective : x))
+    }
+    chat = makeChat(effective, full.messages)
+  }
+
+  const startNew = async () => {
+    await flushSave()
+    if (!settings?.provider) {
+      toast.error("Configure an LLM provider in Settings first")
+      goto("/settings")
+      return
+    }
+    try {
+      const t = await createThread(defaultModelFor(settings.provider))
+      threads = [t, ...threads]
+      activeId = t.id
+      chat = makeChat(t, t.messages)
+    } catch (e) {
+      toast.error(`Create failed: ${(e as Error).message}`)
+    }
+  }
+
+  const removeThread = async (id: string) => {
+    try {
+      await deleteThread(id)
+    } catch (e) {
+      toast.error(`Delete failed: ${(e as Error).message}`)
+      return
+    }
+    threads = threads.filter((t) => t.id !== id)
+    if (activeId === id) {
+      activeId = null
+      chat = null
+      if (threads.length > 0) await setActive(threads[0]!)
+      else await startNew()
+    }
+  }
+
+  const changeModel = async (m: string) => {
+    if (!active) return
+    try {
+      const updated = await updateThread(active.id, { model: m })
+      threads = threads
+        .map((t) => (t.id === updated.id ? { ...t, model: updated.model, updated_at: updated.updated_at } : t))
+        .sort((a, b) => b.updated_at - a.updated_at)
+      const t = threads.find((x) => x.id === updated.id)
+      if (chat && t) chat = makeChat(t, chat.messages)
+    } catch (e) {
+      toast.error(`Update failed: ${(e as Error).message}`)
+    }
+  }
+
+  const session = useSession()
+
+  onMount(async () => {
+    try {
+      const s = await getSettings()
+      settings = s
+      if (!isConfigured(s)) {
+        goto("/settings")
+        return
+      }
+      const initial = await listThreads()
+      threads = initial
+      if (initial.length === 0) await startNew()
+      else await setActive(initial[0]!)
+    } catch (e) {
+      toast.error(`Load failed: ${(e as Error).message}`)
+    }
   })
 
   $effect(() => {
+    if (!$session.isPending && !$session.data) goto("/signin")
+  })
+
+  const onSignOut = async () => {
+    await flushSave()
+    await signOut()
+    goto("/signin")
+  }
+
+  // Schedule debounced save whenever messages change; flush immediately on stream completion.
+  $effect(() => {
     const c = chat
     if (!c || !activeId) return
-    const msgs = c.messages
+    const len = c.messages.length
+    const status = c.status
+    const id = activeId
     untrack(() => {
-      saveMessages(activeId!, msgs)
-      const i = threads.findIndex((t) => t.id === activeId)
-      if (i === -1) return
-      const t = threads[i]!
-      const title = titleFromMessages(msgs) ?? t.title
-      if (title !== t.title || msgs.length > 0) {
-        const updated: Thread = { ...t, title, updatedAt: Date.now() }
-        upsertThread(updated)
-        const rest = threads.filter((x) => x.id !== updated.id)
-        threads = [updated, ...rest].sort((a, b) => b.updatedAt - a.updatedAt)
+      const snapshot = $state.snapshot(c.messages) as UIMessage[]
+      if (status === "ready" || status === "error") {
+        if (len === 0) return
+        pendingThreadId = id
+        pendingMessages = snapshot
+        flushSave()
+        return
       }
+      schedulePersist(id, snapshot)
     })
     if (viewportRef) {
       tick().then(() => {
@@ -172,38 +257,47 @@
 
 <Toaster position="bottom-right" />
 
-<div class="flex h-full">
+<div class="flex h-dvh overflow-hidden">
   <Sidebar {threads} {activeId} onSelect={setActive} onNew={startNew} onDelete={removeThread} />
 
-  <main class="flex min-w-0 flex-1 flex-col">
+  <main class="flex min-h-0 min-w-0 flex-1 flex-col">
     <header class="flex items-center justify-between gap-3 border-b border-border px-4 py-2.5">
       <div class="flex min-w-0 items-center gap-2">
         <div class="truncate text-sm font-medium">{active?.title ?? "harness"}</div>
         {#if active}
           <Badge variant="outline" class="hidden font-mono text-[10px] sm:inline-flex">
-            sb:{active.sessionId.slice(0, 8)}
+            sb:{active.sandbox_session_id.slice(0, 8)}
           </Badge>
         {/if}
       </div>
-      <Select.Root
-        type="single"
-        bind:value={() => currentModel, (v) => changeModel(v as ModelId)}
-      >
-        <Select.Trigger size="sm" class="w-[200px]">{currentModelLabel}</Select.Trigger>
-        <Select.Content>
-          {#each MODEL_OPTIONS as opt (opt.value)}
-            <Select.Item value={opt.value}>
-              <div class="flex w-full items-center justify-between gap-3">
-                <span>{opt.label}</span>
-                <span class="text-[10px] text-muted-foreground">{opt.tier}</span>
-              </div>
-            </Select.Item>
-          {/each}
-        </Select.Content>
-      </Select.Root>
+      <div class="flex items-center gap-2">
+        <ModelPicker value={currentModel} {settings} onSelect={changeModel} />
+        <Button size="icon" variant="ghost" class="size-8" onclick={() => goto("/settings")} aria-label="Settings">
+          <SettingsIcon class="size-3.5" />
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          class="size-8"
+          onclick={toggleMode}
+          aria-label={mode.current === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+        >
+          {#if mode.current === "dark"}
+            <Sun class="size-3.5" />
+          {:else}
+            <Moon class="size-3.5" />
+          {/if}
+        </Button>
+        {#if $session.data}
+          <span class="hidden text-xs text-muted-foreground sm:inline">{$session.data.user.email}</span>
+          <Button size="icon" variant="ghost" class="size-8" onclick={onSignOut} aria-label="Sign out">
+            <LogOut class="size-3.5" />
+          </Button>
+        {/if}
+      </div>
     </header>
 
-    <ScrollArea class="flex-1" bind:viewportRef>
+    <ScrollArea class="min-h-0 flex-1" bind:viewportRef>
       <div class="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6">
         {#if !chat || chat.messages.length === 0}
           <div class="mx-auto mt-12 max-w-2xl">
@@ -232,6 +326,7 @@
         {/if}
 
         {#if chat}
+          {#key activeId}
           <div class="space-y-6">
             {#each chat.messages as message (message.id)}
               <div class="flex gap-3">
@@ -277,20 +372,15 @@
               </div>
             {/if}
           </div>
+          {/key}
         {/if}
       </div>
     </ScrollArea>
 
     <div class="border-t border-border bg-background px-4 py-3 sm:px-6">
       {#if active}
-        <Composer sessionId={active.sessionId} disabled={isBusy} onSend={sendWithFiles} />
+        <Composer sessionId={active.sandbox_session_id} disabled={isBusy} onSend={sendWithFiles} />
       {/if}
-      <div class="mx-auto mt-2 max-w-3xl text-center text-[10px] text-muted-foreground">
-        <span class="font-mono"
-          >bash · python · read · write · edit · list · search · fetch · pip · apt · attach</span
-        >
-        <span class="opacity-60"> · up to 20 steps per turn</span>
-      </div>
     </div>
   </main>
 </div>

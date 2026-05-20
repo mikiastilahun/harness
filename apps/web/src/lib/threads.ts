@@ -3,71 +3,62 @@ import type { UIMessage } from "ai"
 export type Thread = {
   id: string
   title: string
-  sessionId: string
+  sandbox_session_id: string
   model: string
-  createdAt: number
-  updatedAt: number
+  created_at: number
+  updated_at: number
 }
 
-const INDEX_KEY = "harness.threads.v1"
-const msgKey = (id: string) => `harness.thread.v1.${id}`
+export type ThreadWithMessages = Thread & { messages: UIMessage[] }
 
-const safeParse = <T>(v: string | null, fallback: T): T => {
-  if (!v) return fallback
-  try {
-    return JSON.parse(v) as T
-  } catch {
-    return fallback
+const jsonHeaders = { "content-type": "application/json" }
+
+const handle = async <T>(r: Response): Promise<T> => {
+  if (!r.ok) {
+    const text = await r.text().catch(() => "")
+    throw new Error(text || `${r.status} ${r.statusText}`)
   }
+  return (await r.json()) as T
 }
 
-export const loadIndex = (): Thread[] => {
-  if (typeof localStorage === "undefined") return []
-  return safeParse<Thread[]>(localStorage.getItem(INDEX_KEY), [])
-    .filter((t) => t && typeof t.id === "string")
-    .sort((a, b) => b.updatedAt - a.updatedAt)
+export const listThreads = async (): Promise<Thread[]> => {
+  const r = await fetch("/api/threads")
+  const { threads } = await handle<{ threads: Thread[] }>(r)
+  return threads
 }
 
-export const saveIndex = (threads: Thread[]) => {
-  if (typeof localStorage === "undefined") return
-  localStorage.setItem(INDEX_KEY, JSON.stringify(threads))
+export const createThread = async (model: string): Promise<ThreadWithMessages> => {
+  const r = await fetch("/api/threads", {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({ model }),
+  })
+  const { thread } = await handle<{ thread: ThreadWithMessages }>(r)
+  return thread
 }
 
-export const loadMessages = (id: string): UIMessage[] => {
-  if (typeof localStorage === "undefined") return []
-  return safeParse<UIMessage[]>(localStorage.getItem(msgKey(id)), [])
+export const getThread = async (id: string): Promise<ThreadWithMessages> => {
+  const r = await fetch(`/api/threads/${id}`)
+  const { thread } = await handle<{ thread: ThreadWithMessages }>(r)
+  return thread
 }
 
-export const saveMessages = (id: string, messages: UIMessage[]) => {
-  if (typeof localStorage === "undefined") return
-  localStorage.setItem(msgKey(id), JSON.stringify(messages))
+export const updateThread = async (
+  id: string,
+  patch: { title?: string; model?: string; messages?: UIMessage[] },
+): Promise<ThreadWithMessages> => {
+  const r = await fetch(`/api/threads/${id}`, {
+    method: "PUT",
+    headers: jsonHeaders,
+    body: JSON.stringify(patch),
+  })
+  const { thread } = await handle<{ thread: ThreadWithMessages }>(r)
+  return thread
 }
 
-export const deleteThread = (id: string) => {
-  if (typeof localStorage === "undefined") return
-  localStorage.removeItem(msgKey(id))
-  const idx = loadIndex().filter((t) => t.id !== id)
-  saveIndex(idx)
-}
-
-export const upsertThread = (thread: Thread) => {
-  const idx = loadIndex()
-  const i = idx.findIndex((t) => t.id === thread.id)
-  if (i === -1) idx.unshift(thread)
-  else idx[i] = thread
-  saveIndex(idx)
-}
-
-export const newThread = (model: string): Thread => {
-  const now = Date.now()
-  return {
-    id: crypto.randomUUID(),
-    title: "New chat",
-    sessionId: crypto.randomUUID(),
-    model,
-    createdAt: now,
-    updatedAt: now,
-  }
+export const deleteThread = async (id: string): Promise<void> => {
+  const r = await fetch(`/api/threads/${id}`, { method: "DELETE" })
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
 }
 
 export const titleFromMessages = (messages: UIMessage[]): string | null => {

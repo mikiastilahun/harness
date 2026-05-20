@@ -4,24 +4,37 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "start": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "dev": "node --env-file=.env --import tsx --watch src/index.ts",
+    "start": "node --env-file=.env --import tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node --env-file=.env node_modules/drizzle-kit/bin.cjs migrate",
+    "db:push": "node --env-file=.env node_modules/drizzle-kit/bin.cjs push",
+    "db:studio": "node --env-file=.env node_modules/drizzle-kit/bin.cjs studio"
   },
   "dependencies": {
-    "ai": "catalog:",
+    "@ai-sdk/anthropic": "^3.0.78",
+    "@ai-sdk/google": "^3.0.75",
     "@ai-sdk/google-vertex": "catalog:",
-    "hono": "catalog:",
-    "@hono/node-server": "1.13.5",
-    "hono-openapi": "catalog:",
-    "@hono/zod-validator": "catalog:",
-    "zod": "catalog:",
-    "effect": "catalog:",
+    "@ai-sdk/openai": "^3.0.64",
+    "@harness/shared": "workspace:*",
     "@effect/platform": "catalog:",
-    "@kubernetes/client-node": "1.4.0"
+    "@hono/node-server": "1.13.5",
+    "@hono/zod-validator": "catalog:",
+    "@kubernetes/client-node": "1.4.0",
+    "ai": "catalog:",
+    "better-auth": "1.6.11",
+    "drizzle-orm": "0.45.2",
+    "effect": "catalog:",
+    "hono": "catalog:",
+    "hono-openapi": "catalog:",
+    "pg": "8.21.0",
+    "zod": "catalog:"
   },
   "devDependencies": {
     "@types/node": "catalog:",
+    "@types/pg": "8.20.0",
+    "drizzle-kit": "0.31.10",
     "tsx": "4.19.2",
     "typescript": "catalog:"
   }

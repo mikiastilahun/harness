@@ -58,8 +58,6 @@ is proof the container is running inside its own micro-VM.
 
 - `kata-clh` (cloud-hypervisor) is the default; we picked it because it boots fastest.
   Alternatives configured: `kata-qemu`, `kata-fc` (firecracker).
-- Colima persists VM state across restarts; the containerd config edit survives.
-- If you recreate the VM (`colima delete --data`), you must redo this setup.
-- The `kata-deploy` DaemonSet *will* rewrite `/opt/kata/containerd/config.d/kata-deploy.toml`
-  on every restart, but since we put the kata stanzas directly in
-  `/etc/containerd/config.toml` we're not affected.
+- Colima persists VM state across restarts, but **not** `/etc/containerd/config.toml` — it's reset to a 2-line stub on every `colima stop` / `colima start` cycle. Run `pnpm sandbox:up` (or `./infra/kata/start.sh`) after starting colima; it re-applies the kata stanzas and restarts containerd if (and only if) they're missing. The script avoids `colima ssh` (which can fail on user-rc issues) by writing through the `kata-deploy` pod's host mount and `nsenter`-ing into PID 1 to restart containerd.
+- If you recreate the VM (`colima delete --data`), you must redo `setup.sh`.
+- The `kata-deploy` DaemonSet writes to `/opt/kata/containerd/config.d/kata-deploy.toml` on every restart, but since Colima's external containerd doesn't load that drop-in dir, we keep the kata stanzas in `/etc/containerd/config.toml` directly.
