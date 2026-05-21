@@ -12,14 +12,8 @@
     "typecheck": "turbo run typecheck",
     "lint": "oxlint",
     "format": "prettier --write .",
-    "db:up": "docker compose -f infra/docker-compose.yml up -d",
-    "db:down": "docker compose -f infra/docker-compose.yml down",
-    "sandbox:up": "./infra/kata/start.sh",
-    "sandbox:down": "colima stop harness",
-    "db:generate": "pnpm --filter @harness/api db:generate",
-    "db:migrate": "pnpm --filter @harness/api db:migrate",
-    "db:push": "pnpm --filter @harness/api db:push",
-    "db:studio": "pnpm --filter @harness/api db:studio"
+    "sandbox:up": "./infra/agent-sandbox/start.sh",
+    "sandbox:down": "docker stop harness-agent-sandbox-control-plane"
   },
   "devDependencies": {
     "@tsconfig/bun": "catalog:",

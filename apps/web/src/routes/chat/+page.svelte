@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte"
-  import { goto } from "$app/navigation"
   import type { UIMessage } from "ai"
   import { Chat } from "@ai-sdk/svelte"
   import { DefaultChatTransport } from "ai"
@@ -17,13 +16,10 @@
   import Composer from "$lib/components/chat/Composer.svelte"
   import Sparkles from "@lucide/svelte/icons/sparkles"
   import User from "@lucide/svelte/icons/user"
-  import LogOut from "@lucide/svelte/icons/log-out"
   import Loader from "@lucide/svelte/icons/loader-circle"
   import Sun from "@lucide/svelte/icons/sun"
   import Moon from "@lucide/svelte/icons/moon"
-  import SettingsIcon from "@lucide/svelte/icons/settings"
   import { mode, toggleMode } from "mode-watcher"
-  import { signOut, useSession } from "$lib/auth-client"
   import {
     type Thread,
     listThreads,
@@ -33,10 +29,9 @@
     deleteThread,
     titleFromMessages,
   } from "$lib/threads"
-  import { defaultModelFor, parseModel } from "$lib/models"
-  import { getSettings, isConfigured, type Settings } from "$lib/settings"
+  import { DEFAULT_MODEL, isValidModel } from "$lib/models"
 
-  const SAVE_DEBOUNCE_MS = 1500
+  const SAVE_DEBOUNCE_MS = 800
 
   let threads = $state<Thread[]>([])
   let activeId = $state<string | null>(null)
@@ -45,13 +40,10 @@
   let pendingTimer: ReturnType<typeof setTimeout> | null = null
   let pendingThreadId: string | null = null
   let pendingMessages: UIMessage[] | null = null
-  let settings = $state<Settings | null>(null)
 
   const active = $derived(threads.find((t) => t.id === activeId) ?? null)
   const isBusy = $derived(chat?.status === "submitted" || chat?.status === "streaming")
-  const currentModel = $derived<string>(
-    active?.model ?? (settings?.provider ? defaultModelFor(settings.provider) : ""),
-  )
+  const currentModel = $derived<string>(active?.model ?? DEFAULT_MODEL)
 
   const makeChat = (t: Thread, initial: UIMessage[]) =>
     new Chat({
@@ -63,7 +55,7 @@
       onError: (e) => toast.error(e.message),
     })
 
-  const flushSave = async () => {
+  const flushSave = () => {
     if (pendingTimer) {
       clearTimeout(pendingTimer)
       pendingTimer = null
@@ -75,14 +67,11 @@
     pendingMessages = null
     const t = threads.find((x) => x.id === id)
     const title = (t && titleFromMessages(messages)) ?? t?.title ?? "New chat"
-    try {
-      const updated = await updateThread(id, { title, messages })
-      threads = threads
-        .map((x) => (x.id === updated.id ? { ...x, title: updated.title, updated_at: updated.updated_at } : x))
-        .sort((a, b) => b.updated_at - a.updated_at)
-    } catch (e) {
-      toast.error(`Save failed: ${(e as Error).message}`)
-    }
+    const updated = updateThread(id, { title, messages })
+    if (!updated) return
+    threads = threads
+      .map((x) => (x.id === updated.id ? { ...x, title: updated.title, updated_at: updated.updated_at } : x))
+      .sort((a, b) => b.updated_at - a.updated_at)
   }
 
   const schedulePersist = (id: string, messages: UIMessage[]) => {
@@ -95,97 +84,54 @@
     }, SAVE_DEBOUNCE_MS)
   }
 
-  const setActive = async (t: Thread) => {
-    if (activeId && activeId !== t.id) await flushSave()
+  const setActive = (t: Thread) => {
+    if (activeId && activeId !== t.id) flushSave()
     activeId = t.id
-    const full = await getThread(t.id)
-    let effective: Thread = t
-    if (!parseModel(t.model) && settings?.provider) {
-      const migratedModel = defaultModelFor(settings.provider)
-      const updated = await updateThread(t.id, { model: migratedModel })
-      effective = { ...t, model: updated.model, updated_at: updated.updated_at }
-      threads = threads.map((x) => (x.id === effective.id ? effective : x))
-    }
-    chat = makeChat(effective, full.messages)
+    const full = getThread(t.id)
+    chat = makeChat(t, full?.messages ?? [])
   }
 
-  const startNew = async () => {
-    await flushSave()
-    if (!settings?.provider) {
-      toast.error("Configure an LLM provider in Settings first")
-      goto("/settings")
-      return
-    }
-    try {
-      const t = await createThread(defaultModelFor(settings.provider))
-      threads = [t, ...threads]
-      activeId = t.id
-      chat = makeChat(t, t.messages)
-    } catch (e) {
-      toast.error(`Create failed: ${(e as Error).message}`)
-    }
+  const startNew = () => {
+    flushSave()
+    const t = createThread(active?.model ?? DEFAULT_MODEL)
+    threads = [t, ...threads.filter((x) => x.id !== t.id)]
+    activeId = t.id
+    chat = makeChat(t, t.messages)
   }
 
-  const removeThread = async (id: string) => {
-    try {
-      await deleteThread(id)
-    } catch (e) {
-      toast.error(`Delete failed: ${(e as Error).message}`)
-      return
-    }
+  const removeThread = (id: string) => {
+    deleteThread(id)
     threads = threads.filter((t) => t.id !== id)
     if (activeId === id) {
       activeId = null
       chat = null
-      if (threads.length > 0) await setActive(threads[0]!)
-      else await startNew()
+      if (threads.length > 0) setActive(threads[0]!)
+      else startNew()
     }
   }
 
-  const changeModel = async (m: string) => {
+  const changeModel = (m: string) => {
     if (!active) return
-    try {
-      const updated = await updateThread(active.id, { model: m })
-      threads = threads
-        .map((t) => (t.id === updated.id ? { ...t, model: updated.model, updated_at: updated.updated_at } : t))
-        .sort((a, b) => b.updated_at - a.updated_at)
-      const t = threads.find((x) => x.id === updated.id)
-      if (chat && t) chat = makeChat(t, chat.messages)
-    } catch (e) {
-      toast.error(`Update failed: ${(e as Error).message}`)
-    }
+    const updated = updateThread(active.id, { model: m })
+    if (!updated) return
+    threads = threads
+      .map((t) => (t.id === updated.id ? { ...t, model: updated.model, updated_at: updated.updated_at } : t))
+      .sort((a, b) => b.updated_at - a.updated_at)
+    const t = threads.find((x) => x.id === updated.id)
+    if (chat && t) chat = makeChat(t, chat.messages)
   }
 
-  const session = useSession()
-
-  onMount(async () => {
-    try {
-      const s = await getSettings()
-      settings = s
-      if (!isConfigured(s)) {
-        goto("/settings")
-        return
-      }
-      const initial = await listThreads()
-      threads = initial
-      if (initial.length === 0) await startNew()
-      else await setActive(initial[0]!)
-    } catch (e) {
-      toast.error(`Load failed: ${(e as Error).message}`)
-    }
+  onMount(() => {
+    // Migrate any thread with a model that's no longer in MODELS to DEFAULT_MODEL.
+    const initial = listThreads().map((t) =>
+      isValidModel(t.model) ? t : { ...t, model: DEFAULT_MODEL },
+    )
+    threads = initial
+    if (initial.length === 0) startNew()
+    else setActive(initial[0]!)
   })
 
-  $effect(() => {
-    if (!$session.isPending && !$session.data) goto("/signin")
-  })
-
-  const onSignOut = async () => {
-    await flushSave()
-    await signOut()
-    goto("/signin")
-  }
-
-  // Schedule debounced save whenever messages change; flush immediately on stream completion.
+  // Persist messages on every change (debounced) and flush immediately when the stream completes.
   $effect(() => {
     const c = chat
     if (!c || !activeId) return
@@ -214,9 +160,7 @@
     if (!chat) return
     const intro = attachedPaths.length === 0
       ? text
-      : (text
-          ? `${text}\n\n`
-          : "") +
+      : (text ? `${text}\n\n` : "") +
         `Attached file${attachedPaths.length > 1 ? "s" : ""}: ${attachedPaths.map((p) => `\`${p}\``).join(", ")}`
     if (!intro.trim()) return
     chat.sendMessage({ text: intro })
@@ -271,10 +215,7 @@
         {/if}
       </div>
       <div class="flex items-center gap-2">
-        <ModelPicker value={currentModel} {settings} onSelect={changeModel} />
-        <Button size="icon" variant="ghost" class="size-8" onclick={() => goto("/settings")} aria-label="Settings">
-          <SettingsIcon class="size-3.5" />
-        </Button>
+        <ModelPicker value={currentModel} onSelect={changeModel} />
         <Button
           size="icon"
           variant="ghost"
@@ -288,12 +229,6 @@
             <Moon class="size-3.5" />
           {/if}
         </Button>
-        {#if $session.data}
-          <span class="hidden text-xs text-muted-foreground sm:inline">{$session.data.user.email}</span>
-          <Button size="icon" variant="ghost" class="size-8" onclick={onSignOut} aria-label="Sign out">
-            <LogOut class="size-3.5" />
-          </Button>
-        {/if}
       </div>
     </header>
 
@@ -305,8 +240,8 @@
               <Sparkles class="mx-auto mb-3 size-6 text-muted-foreground" />
               <h2 class="text-base font-medium">How can I help with this project?</h2>
               <p class="mt-1 text-xs text-muted-foreground">
-                The agent has a kata-isolated sandbox with python, node, bash. Attach files to the composer and the
-                agent can read them; it will attach its deliverables back to chat.
+                The agent has a Linux sandbox with python, node, and bash. Attach files to the
+                composer and the agent can read them; it will attach its deliverables back to chat.
               </p>
             </div>
             <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">

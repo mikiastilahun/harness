@@ -5,7 +5,7 @@ import * as sandbox from "../sandbox/provider"
 export const sandboxTools = (sessionId: string) => ({
   bash: tool({
     description:
-      "Run a shell command in the agent's persistent Linux sandbox (kata micro-VM). Working directory persists across calls. Output limited to 256KB. Combined stdout+stderr is returned along with the exit code.",
+      "Run a shell command in the agent's persistent Linux sandbox. Working directory persists across calls. Output limited to 256KB. Combined stdout+stderr is returned along with the exit code.",
     inputSchema: z.object({
       command: z.string().describe("The shell command. Bash syntax."),
       timeout_seconds: z.number().int().min(1).max(600).optional().describe("Timeout in seconds; default 60."),

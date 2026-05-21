@@ -1,10 +1,17 @@
 # harness
 
-An AI harness for engineering teams (initial focus: construction). A SvelteKit chat
-frontend talks to a Hono backend that calls **Vertex AI Gemini** via the **Vercel AI
-SDK**, and the agent has a real **kata-containers** Linux sandbox to run code,
-read/write files, and verify its own work — running locally on Apple Silicon
-through nested virtualization.
+An AI harness for engineering teams (initial focus: construction). A SvelteKit
+chat frontend talks to a Hono backend that calls **Vertex AI Gemini** via the
+**Vercel AI SDK**, and the agent has a real Linux sandbox to run code,
+read/write files, and verify its own work. Each chat is backed by a
+per-session pod managed by the upstream
+[**agent-sandbox**](https://agent-sandbox.sigs.k8s.io/) controller on a local
+[kind](https://kind.sigs.k8s.io/) cluster.
+
+No sign-in, no database. Chats live in browser `localStorage`.
+
+> **New to the project? Start with [SETUP.md](SETUP.md)** — step-by-step
+> "run on another machine" guide.
 
 ---
 
@@ -12,38 +19,20 @@ through nested virtualization.
 
 ```sh
 # one-time
-./infra/kata/setup.sh                                  # ~10 min, provisions colima + kata
-gcloud auth application-default login                   # ADC for Vertex
-cp .env.example .env                                    # adjust GCP project, fill BETTER_AUTH_SECRET + GOOGLE_CLIENT_ID/SECRET
+./infra/agent-sandbox/setup.sh         # kind cluster + agent-sandbox controller + sandbox image
+gcloud auth application-default login   # ADC for Vertex
+cp .env.example .env                    # set GOOGLE_VERTEX_PROJECT
 pnpm install
-pnpm db:up                                              # start postgres (docker)
-pnpm db:migrate                                         # apply drizzle migrations
 
-# every-boot (colima resets /etc/containerd/config.toml on stop/start —
-# sandbox:up re-applies the kata stanzas and restarts containerd if needed)
-pnpm sandbox:up                                         # ~30s on a cold boot, instant if already running
+# every-boot
+pnpm sandbox:up                         # docker start the kind node + wait for controller
 
 # run
-pnpm dev
-# → http://localhost:5173 (sign in with Google)
+pnpm dev                                # http://localhost:5173
 ```
 
-### Auth setup (one-time)
-
-1. Generate a session secret and put it in `.env` as `BETTER_AUTH_SECRET`:
-   ```sh
-   openssl rand -base64 32
-   ```
-2. Create an OAuth client in **Google Cloud Console → APIs & Services → Credentials**:
-   - Application type: **Web application**
-   - Authorized redirect URI: `http://localhost:8787/auth/callback/google`
-   - Copy the client ID/secret into `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
-3. Postgres runs locally via `bun db:up` (see `infra/docker-compose.yml`). The default
-   `DATABASE_URL=postgres://harness:harness@localhost:5432/harness` matches it.
-4. `bun db:migrate` applies the drizzle migrations in `apps/api/drizzle/`.
-
-Try: *"Use your bash tool to write a Python script that lists the first 20 primes,
-save it as /tmp/primes.py, run it, and show me the output."*
+Try: *"Use your bash tool to write a Python script that lists the first 20
+primes, save it as /workspace/primes.py, run it, and show me the output."*
 
 ---
 
@@ -52,50 +41,50 @@ save it as /tmp/primes.py, run it, and show me the output."*
 ```mermaid
 flowchart LR
   subgraph Browser
-    UI[Svelte 5 chat UI<br/>useChat from @ai-sdk/svelte]
+    UI[Svelte 5 chat UI<br/>useChat from @ai-sdk/svelte<br/>localStorage: harness.threads]
   end
 
   subgraph SvelteKit["apps/web · SvelteKit 2"]
-    Pages["pages: /signin, /chat<br/>better-auth/svelte client"]
+    Pages["pages: /chat<br/>BFF proxy /api/*"]
   end
 
-  subgraph Hono["apps/api · Hono on Node"]
-    Auth["/auth/*<br/>better-auth handler<br/>Google OAuth"]
-    Chat["/chat route<br/>streamText + tools<br/>(session-gated)"]
-    Tools["sandbox tools<br/>bash · read_file · write_file · list_dir"]
+  subgraph Hono["apps/api · Hono on Node 22"]
+    Chat["/chat route<br/>streamText + tools"]
+    Tools["sandbox tools<br/>bash · read_file · write_file · list_dir · …"]
     Provider["SandboxProvider<br/>@kubernetes/client-node"]
-  end
-
-  subgraph Postgres["postgres (docker)"]
-    DB[(better-auth tables<br/>user · session · account · verification)]
   end
 
   subgraph GCP[Google Cloud]
     Vertex[Vertex AI<br/>Gemini 2.5 pro/flash]
   end
 
-  subgraph Kata["Colima VM · k3s · containerd 2.x"]
-    Pod["kata-clh pod per session<br/>python:3.12-slim-bookworm<br/>guest kernel 6.12"]
+  subgraph Kind["kind cluster · agent-sandbox controller"]
+    Ctrl["agent-sandbox-controller<br/>(reconciles Sandbox CRs)"]
+    Pod["Sandbox CR → pod<br/>per chat session<br/>harness-sandbox:1"]
+    Ctrl -.creates.-> Pod
   end
 
-  UI -->|"cross-origin fetch<br/>credentials: include"| Chat
-  UI -->|"sign in"| Auth
-  Auth --> DB
-  Chat -->|"getSession"| Auth
-  Chat -->|"AI SDK streamText"| Vertex
+  UI -->|"fetch /api/chat"| Pages
+  Pages -->|"BFF proxy"| Chat
+  Chat -->|"AI SDK streamText (ADC)"| Vertex
   Vertex -->|"tool calls"| Chat
   Chat --> Tools
   Tools --> Provider
-  Provider -->|"k8s Exec API<br/>(WebSocket)"| Pod
+  Provider -->|"create/get Sandbox CR<br/>+ k8s Exec API (WebSocket)"| Ctrl
+  Provider -->|"exec into pod"| Pod
   Pod -.->|"stdout/stderr/exit"| Provider
-  Chat -.->|"streamed UI parts"| UI
+  Chat -.->|"streamed UI parts"| Pages
 ```
 
-Three independent processes on your Mac:
+Two local processes:
 
-- **`tsx watch src/index.ts`** (Hono on `:8787`, **Node 22**) — owns the AI SDK call, tool dispatch, and direct k8s exec into the sandbox via `@kubernetes/client-node`.
-- **`vite dev`** (SvelteKit on `:5173`) — serves the chat UI and proxies `/api/chat` to the Hono server.
-- **`colima-harness` VM** — Linux + k3s + kata. Independent of the app processes; survives restarts.
+- **`tsx watch src/index.ts`** (Hono on `:8787`, **Node 22**) — AI SDK call,
+  tool dispatch, k8s API access via `@kubernetes/client-node`.
+- **`vite dev`** (SvelteKit on `:5173`) — chat UI; proxies `/api/*` to Hono.
+
+…plus the **kind cluster** (a Docker container) hosting k8s with the
+agent-sandbox controller installed. Independent of the app processes;
+survives app restarts.
 
 ---
 
@@ -103,22 +92,20 @@ Three independent processes on your Mac:
 
 | Layer | Choice | Notes |
 |---|---|---|
-| api runtime | **Node 22** (TypeScript via `tsx`) | switched off Bun so `@kubernetes/client-node` works natively (Bun fetch can't apply client-cert TLS from kubeconfig) |
-| web runtime | **Bun** (vite dev) | unchanged — Vite is happy on Bun |
-| Package manager | **Bun workspaces + catalog** | one PM across both apps; matches opencode conventions |
+| api runtime | **Node 22** (TypeScript via `tsx`) | required for `@kubernetes/client-node`'s TLS / client-cert handling |
+| web runtime | **Node + Vite** | SvelteKit dev server |
+| Package manager | **pnpm 10** workspaces + catalog | one PM across both apps |
 | Monorepo | **Turbo** | dev/build pipelines, env passthrough |
 | Frontend | **SvelteKit 2** + **Svelte 5** runes + **Tailwind 4** + **shadcn-svelte** + **bits-ui** | full design system |
 | Chat client | **`@ai-sdk/svelte`** `Chat` + `DefaultChatTransport` | UI message stream protocol |
+| Chat persistence | **browser localStorage** | `harness.threads` index + `harness.thread.<id>` records. No server DB. |
 | API server | **Hono 4** + **`@hono/node-server`** | runs on Node's http; long streams just work |
-| LLM | **Vercel AI SDK 6** (`ai@6.0.185`) + **`@ai-sdk/google-vertex`** | Gemini 3.1 Pro / 2.5 series via ADC (location=global) |
-| k8s client | **`@kubernetes/client-node` 1.4** | direct SDK; pod CRUD via `CoreV1Api`, command exec via `Exec` over WebSocket |
+| LLM | **Vercel AI SDK** + **`@ai-sdk/google-vertex`** | Gemini 2.5 / 3 family via ADC |
 | Vertex auth | **gcloud ADC** | `gcloud auth application-default login` |
-| User auth | **better-auth** (Google OAuth) | session cookie set by API; web calls API cross-origin with `credentials: include` |
-| Database | **Postgres 17** (docker locally) | runs via `infra/docker-compose.yml`; schema via **drizzle-orm** + **drizzle-kit** |
-| Sandbox runtime | **kata-containers 3.13** w/ **cloud-hypervisor** | real micro-VM, not just a container |
-| Local k8s | **k3s** inside **Colima** w/ **vz + nested-virtualization** | Apple's Virtualization.framework on M3+ |
-| Container runtime | **containerd 2.2** (config schema **v3**) | Colima's external containerd, not k3s-embedded |
-| Style guide | inline over helper, no `else`, no `try/catch`, snake_case in Drizzle | see `AGENTS.md` |
+| k8s client | **`@kubernetes/client-node` 1.4** | direct SDK; `Sandbox` CR CRUD via `CustomObjectsApi`, command exec via `Exec` over WebSocket |
+| Sandbox controller | **[agent-sandbox](https://agent-sandbox.sigs.k8s.io/) v0.4.6** | `Sandbox` / `SandboxTemplate` CRDs + controller |
+| Local k8s | **[kind](https://kind.sigs.k8s.io/)** (Kubernetes-in-Docker) | one container per cluster node |
+| Style guide | inline over helper, no `else`, no `try/catch` | see `AGENTS.md` |
 
 ---
 
@@ -127,57 +114,47 @@ Three independent processes on your Mac:
 ```
 harness/
 ├─ apps/
-│  ├─ api/                       Hono server, AI SDK, sandbox, auth
-│  │  ├─ drizzle/                generated SQL migrations
-│  │  ├─ drizzle.config.ts       drizzle-kit config
+│  ├─ api/                       Hono server, AI SDK, sandbox
 │  │  └─ src/
-│  │     ├─ index.ts             @hono/node-server + Hono routes + /auth/*
-│  │     ├─ auth.ts              better-auth instance (Google OAuth)
-│  │     ├─ runtime.ts           Effect ManagedRuntime (empty until Phase D)
-│  │     ├─ db/
-│  │     │  ├─ index.ts          pg Pool + drizzle client
-│  │     │  └─ schema.ts         better-auth tables (user/session/account/verification)
-│  │     ├─ middleware/
-│  │     │  └─ require-auth.ts   session gate for /chat, /sandbox
+│  │     ├─ index.ts             @hono/node-server + Hono routes
 │  │     ├─ ai/
-│  │     │  ├─ models.ts         Vertex provider registry
-│  │     │  ├─ system-prompt.ts  base prompt + sandbox doc
+│  │     │  ├─ models.ts         Vertex (ADC) model builder
+│  │     │  ├─ system-prompt.ts  base prompt
 │  │     │  └─ tools.ts          AI SDK tools wired to sandbox
 │  │     ├─ routes/
 │  │     │  ├─ chat.ts           POST /chat → streamText
+│  │     │  ├─ sandbox.ts        upload/download files
 │  │     │  └─ health.ts         GET /health
 │  │     └─ sandbox/
-│  │        ├─ provider.ts       per-session pod lifecycle + exec
+│  │        ├─ provider.ts       Sandbox CR lifecycle + exec
 │  │        └─ smoke.ts          manual test script
 │  │
 │  └─ web/                       SvelteKit chat UI
 │     └─ src/
-│        ├─ app.css              tailwind 4 import
-│        ├─ app.html             shell
 │        ├─ lib/
-│        │  ├─ api.ts            PUBLIC_API_URL helper
-│        │  └─ auth-client.ts    better-auth/svelte client
-│        ├─ routes/
-│        │  ├─ +layout.svelte    css import
-│        │  ├─ +page.server.ts   307 → /chat
-│        │  ├─ signin/+page.svelte    Google sign-in
-│        │  └─ chat/+page.svelte chat UI (model picker, tool render)
-│        └─ ...
+│        │  ├─ threads.ts        localStorage thread CRUD
+│        │  ├─ models.ts         re-exports @harness/shared models
+│        │  ├─ proxy.ts          BFF passthrough to apps/api
+│        │  └─ components/chat/  Sidebar, ModelPicker, ToolPart, FileCard, …
+│        └─ routes/
+│           ├─ +page.server.ts   307 → /chat
+│           ├─ chat/+page.svelte chat UI (sidebar + per-thread Chat)
+│           └─ api/[...path]/    BFF: forwards to apps/api
 │
+├─ packages/shared/              ModelInfo + Gemini model registry
 ├─ infra/
-│  ├─ docker-compose.yml         postgres for local dev
-│  └─ kata/
-│     ├─ setup.sh                one-shot provisioner
-│     ├─ containerd-config.toml  v3 schema with kata runtimes
+│  ├─ sandbox/Dockerfile         harness-sandbox:1 (Debian + Python + Node + tools)
+│  └─ agent-sandbox/
+│     ├─ setup.sh                one-shot provisioner (kind + controller + image)
+│     ├─ start.sh                every-boot helper
 │     └─ README.md
 │
-├─ package.json                  bun workspaces + catalog
+├─ SETUP.md                      "run on another machine" walkthrough
+├─ package.json                  pnpm workspaces
 ├─ turbo.json                    dev/build pipelines + env passthrough
-├─ tsconfig.json                 base, extends @tsconfig/bun
-├─ AGENTS.md                     style rules (cribbed from opencode)
+├─ AGENTS.md                     style rules
 ├─ .env.example
-├─ .prettierrc                   semi: false, printWidth: 120
-└─ .oxlintrc.json
+└─ .prettierrc / .oxlintrc.json
 ```
 
 ---
@@ -191,46 +168,58 @@ sequenceDiagram
   participant W as SvelteKit<br/>:5173
   participant A as Hono /chat<br/>:8787
   participant G as Vertex AI<br/>(Gemini)
-  participant K as k8s API
-  participant P as Pod<br/>(kata-clh)
+  participant K as k8s API<br/>(kind)
+  participant C as agent-sandbox<br/>controller
+  participant P as Pod<br/>(harness-sb-…)
 
-  U->>W: types prompt, useChat POSTs<br/>{sessionId, model, messages}
-  W->>A: proxies request body verbatim
+  U->>W: types prompt, useChat POSTs<br/>{model, sessionId, messages}
+  W->>A: proxies request body
   A->>A: convertToModelMessages(parts)<br/>build tools(sessionId)
   A->>G: streamText({system, messages, tools})
 
-  G-->>A: tool-call: bash("python3 /tmp/x.py")
+  G-->>A: tool-call: bash("python3 /workspace/x.py")
   A->>A: sandbox.bash(sessionId, cmd)
-  A->>K: Exec API (WebSocket)
-  Note over K,P: first call: ensure ns + pod,<br/>wait for Running
+  A->>K: get / create Sandbox CR<br/>(CustomObjectsApi)
+  K->>C: reconcile
+  C->>K: create pod with the same name
+  K-->>A: Sandbox.status.conditions[Ready=True]
+  A->>K: Exec API (WebSocket) → pod
   K->>P: exec into shell container
   P-->>K: stdout, stderr, V1Status
   K-->>A: streams resolved, exit code parsed
   A-->>G: tool-result: {stdout, exit, truncated}
 
   G-->>A: text-delta: "The script ran..."
-  A-->>W: UI message stream<br/>(tool-input-*, tool-output-*, text-delta, finish)
-  W-->>U: streaming render
+  A-->>W: UI message stream
+  W-->>U: streaming render + localStorage save
 ```
 
 ### Provider internals (`apps/api/src/sandbox/provider.ts`)
 
-Pod CRUD and exec all go through `@kubernetes/client-node` directly. One
-shared `Exec` instance opens a WebSocket per call; stdin / stdout / stderr are
-plain Node streams. Exit codes come from the API server's
-`V1Status.details.causes` field on close — no need to wrap the command in an
-echo-the-exit-code trick.
+The provider talks to two k8s APIs:
+
+- `CustomObjectsApi` — CRUD on `Sandbox` CRs in the
+  `agents.x-k8s.io/v1alpha1` group. `ensureSandbox` creates the CR if missing,
+  then polls `status.conditions[type=Ready, status=True]`.
+- `Exec` — WebSocket into the pod the controller materialized. The pod name
+  equals the Sandbox name, so exec targets `sandboxName(sessionId)` directly.
+  Exit codes come from `V1Status.details.causes` on close.
 
 ```ts
-const kc = new k8s.KubeConfig()
-kc.loadFromDefault()
-kc.setCurrentContext("colima-harness")
-
-const core    = kc.makeApiClient(k8s.CoreV1Api)
+const cuapi   = kc.makeApiClient(k8s.CustomObjectsApi)
 const execApi = new k8s.Exec(kc)
 
-// command exec: streams stdin/out/err, resolves with exit code
-execApi.exec(NS, podName, "shell", cmd, outStream, errStream, stdinStream, false, (status) => {
+// create Sandbox CR (controller materializes a pod with the same name)
+await cuapi.createNamespacedCustomObject({
+  group: "agents.x-k8s.io",
+  version: "v1alpha1",
+  namespace: NS,
+  plural: "sandboxes",
+  body: sandboxBody(sessionId),
+})
+
+// later: exec into the pod
+execApi.exec(NS, sandboxName(sessionId), "shell", cmd, outStream, errStream, stdinStream, false, (status) => {
   // V1Status → resolve({ stdout, stderr, exit })
 })
 ```
@@ -241,181 +230,22 @@ compose this same exec primitive — no `kubectl` subprocess anywhere.
 
 ---
 
-## Sandbox architecture (the deep part)
+## Backend in 90 seconds
 
-This is the work that took the most fighting. The chain runs through **six**
-layers of containment:
+`POST /chat` is essentially:
 
-```mermaid
-flowchart TB
-  subgraph H["macOS host · Apple M4 Pro · macOS 26.5"]
-    Hyper["Apple Virtualization.framework<br/>(nested-virt enabled)"]
-
-    subgraph VM["Colima VM · Ubuntu 24.04 · kernel 6.8"]
-      KVM["/dev/kvm exposed by nested virt"]
-
-      subgraph CTD["containerd 2.2 (Colima, systemd-managed)"]
-        Shim["containerd-shim-kata-v2<br/>(runtime: kata-clh)"]
-
-        subgraph K3S["k3s control plane<br/>(uses Colima's containerd via socket)"]
-          API[k8s API server]
-        end
-      end
-
-      subgraph Pod["Pod harness-sb-&lt;session&gt;"]
-        CLH["cloud-hypervisor micro-VM<br/>(kata guest, KVM-backed)"]
-        subgraph CLHI["kata guest · kernel 6.12"]
-          App[shell container<br/>python:3.12-slim-bookworm]
-        end
-      end
-    end
-  end
-
-  Hyper --- KVM
-  Shim -.creates.-> CLH
-  CLH --- CLHI
-  API -.scheduled to.-> Pod
+```ts
+streamText({
+  model: buildModel(modelId),           // vertex(modelId) — ADC, no key
+  system: baseSystemPrompt,
+  messages: await convertToModelMessages(input.messages),
+  tools: sandboxTools(sessionId),
+  stopWhen: stepCountIs(20),
+}).toUIMessageStreamResponse()
 ```
 
-### Why each layer
-
-1. **`Apple Virtualization.framework` with `vz` vmType + `nestedVirtualization: true`.**
-   Apple's Virtualization framework supports nested virt on M3+ silicon and
-   macOS 13+. Lima 2.1's `nestedVirtualization: true` flag opts into it — Colima
-   0.10's `--nested-virtualization` flag passes that through. Without this,
-   `/dev/kvm` doesn't exist inside the VM and any KVM-backed kata variant
-   (`kata-clh`, `kata-fc`) refuses to start pods.
-
-2. **A Linux VM (Ubuntu 24.04) instead of running natively on macOS.** Kata
-   needs Linux — containerd, kvm, cgroups, the whole stack. Colima boots this
-   VM and exposes a Docker/k8s context to the host.
-
-3. **`containerd` (Colima's own, NOT k3s-embedded).** Colima 0.10 with
-   `--runtime containerd --kubernetes` runs **one** containerd as a systemd
-   service inside the VM, and points k3s at it via
-   `--container-runtime-endpoint`. This is non-obvious: kata-deploy's k3s
-   overlay assumes k3s's *embedded* containerd, so it wrote a drop-in to
-   `/var/lib/rancher/k3s/agent/etc/containerd/config.toml` that nothing was
-   reading. We had to lift the kata runtime blocks into
-   `/etc/containerd/config.toml` instead.
-
-4. **containerd config schema v3.** containerd 2.x switched the runtime plugin
-   path to `[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.<name>]`.
-   The kata-deploy DaemonSet still writes the v2 schema
-   (`[plugins.cri.containerd.runtimes.<name>]`) which containerd 2.x parses
-   without error and then **silently ignores**. `infra/kata/containerd-config.toml`
-   has the correct v3 stanzas for `kata-clh`, `kata-qemu`, `kata-fc`.
-
-5. **`kata-clh` (cloud-hypervisor) as the runtime class.** Three options were
-   available; we picked cloud-hypervisor because it boots fastest
-   (~1–2s vs ~3–5s for kata-qemu). kata-fc (firecracker) is also available if
-   we ever want it.
-
-6. **The kata guest kernel is 6.12 while the host VM is 6.8.** This is the
-   actual proof of isolation: each pod boots its **own** Linux kernel inside a
-   cloud-hypervisor VM. A container escape would still hit the kata guest
-   kernel, then a hypervisor boundary, then the host VM, before reaching macOS.
-
-### Pod lifecycle
-
-```mermaid
-flowchart LR
-  R[chat request<br/>sessionId=X] --> A{pod for X exists?}
-  A -- "no" --> C[POST Pod spec<br/>runtimeClassName: kata-clh<br/>image: python:3.12-slim-bookworm<br/>command: sleep infinity]
-  C --> W[wait condition=Ready<br/>--timeout=90s]
-  A -- "yes, Running" --> E
-  W --> E[Exec API · WebSocket<br/>bash -lc &lt;cmd&gt;]
-  E --> O[stdout / stderr / V1Status<br/>→ exit code]
-  O --> R2[tool result back to model]
-```
-
-- One pod per `sessionId`. Web UI generates a UUID per browser and persists it
-  in `localStorage` under `harness.sessionId`.
-- Pod stays alive (`sleep infinity`) across tool calls so the agent has a
-  **persistent filesystem and working directory** within a session — exactly
-  like a long-running shell.
-- No TTL reaper yet. Pods accumulate; clean them up with
-  `kubectl --context colima-harness -n harness-sandboxes delete pods --all`.
-- Resource limits: `cpu: 2 / memory: 1Gi`. Adjust in `provider.ts`.
-
-### Why Node for the api, Bun for the web
-
-We started with both apps on Bun. The k8s SDK broke in two ways:
-
-1. `fetch` against `https://127.0.0.1:54910` failed with
-   `SELF_SIGNED_CERT_IN_CHAIN` because Bun's `fetch` doesn't pick up CAs from a
-   custom `https.Agent`.
-2. With `NODE_TLS_REJECT_UNAUTHORIZED=0`, requests got past TLS but the
-   kubeconfig's **client cert** never reached the wire — Bun's `fetch` ignored
-   agent-level `cert`/`key`. Result: 401.
-
-Rather than shell out to `kubectl` (the original workaround), we run the api
-process on **Node** via `tsx` — Node's `https.Agent` applies the CA + client
-cert correctly, so the SDK works as designed. Bun stays as the package manager
-(workspaces, catalog) and as the web dev runtime. Roughly:
-
-```
-apps/api  →  Node 22 + tsx          (uses @kubernetes/client-node)
-apps/web  →  Bun + Vite             (frontend, no k8s interaction)
-pkg mgr   →  Bun                    (install/lockfile/catalog)
-```
-
-This split keeps Bun where it shines (fast installs, fast dev for the
-frontend) and puts the api on Node where the SDK ecosystem expects to be.
-
----
-
-## Local setup, in detail
-
-### 1. Prereqs
-
-- Apple Silicon **M3 or newer** (nested virt). On Intel Macs or M1/M2,
-  `kata-clh` won't work — fall back to `kata-qemu` (slower TCG mode).
-- macOS 13+ (for Virtualization.framework's nested-virt support).
-- Bun ≥ 1.3.
-- `kubectl` on PATH (Homebrew or `brew install kubernetes-cli`).
-- `gcloud` CLI, authed:
-  `gcloud auth application-default login` — this writes
-  `~/.config/gcloud/application_default_credentials.json` which `@ai-sdk/google-vertex`
-  picks up automatically.
-- Vertex AI API enabled on your GCP project.
-
-### 2. Kata cluster (`./infra/kata/setup.sh`)
-
-The script automates what we did interactively in this session:
-
-| Step | What it does | Why |
-|---|---|---|
-| `colima start --profile harness --kubernetes --runtime containerd --vm-type=vz --nested-virtualization --cpu 4 --memory 8 --disk 60` | Boots a Linux VM with k3s and `/dev/kvm` exposed | The base sandbox host |
-| `kubectl apply -k kata-rbac/base?ref=3.13.0` | Creates the SA + ClusterRole kata-deploy uses | RBAC must exist before the DaemonSet |
-| `kubectl apply -k kata-deploy/overlays/k3s?ref=3.13.0` | DaemonSet that installs kata binaries to `/opt/kata` on each node | Standard upstream install |
-| `set image kube-kata=quay.io/kata-containers/kata-deploy:3.13.0` | Pins the image | `:latest` is currently a bash-less arm64 build that crash-loops |
-| `set env CREATE_RUNTIMECLASSES=true` | DaemonSet creates the `RuntimeClass` objects | Off by default in the k3s overlay |
-| Write `/etc/containerd/config.toml` from `infra/kata/containerd-config.toml` | v3-schema kata runtimes inline | Bypasses kata-deploy's v2-schema drop-in that containerd 2.x ignores |
-| `systemctl restart containerd` | Re-reads config | kata runtimes become visible to CRI |
-| Smoke test with `runtimeClassName: kata-clh` | Pod runs and exits 0 | Proves the chain works end-to-end |
-
-### 3. Env
-
-`.env.example` documents all relevant vars; passed through to apps by `turbo.json`'s `globalPassThroughEnv`:
-
-```
-GOOGLE_VERTEX_PROJECT=qa1-us-central1-vpc-63b3e2
-GOOGLE_VERTEX_LOCATION=us-central1
-
-API_PORT=8787
-API_URL=http://localhost:8787
-
-KATA_CONTEXT=colima-harness
-KATA_NAMESPACE=harness-sandboxes
-KATA_RUNTIME_CLASS=kata-clh
-SANDBOX_IMAGE=python:3.12-slim-bookworm
-```
-
-### 4. Run
-
-`bun dev` runs `turbo run dev --parallel` which boots both apps. SvelteKit's
-HMR + Bun's `--watch` mean edits reload immediately.
+`stopWhen: stepCountIs(20)` lets Gemini iterate up to 20 tool-use rounds in a
+single user turn.
 
 ---
 
@@ -425,147 +255,76 @@ HMR + Bun's `--watch` mean edits reload immediately.
 
 ```svelte
 const chat = new Chat({
+  messages: thread.messages,
   transport: new DefaultChatTransport({
     api: "/api/chat",
-    body: () => ({ model, sessionId }),
+    body: () => ({ model: thread.model, sessionId: thread.sandbox_session_id }),
   }),
 })
 
 chat.sendMessage({ text })
 // chat.messages is reactive; iterate parts and render
+// debounced effect writes chat.messages → localStorage on every change
 ```
 
-`@ai-sdk/svelte`'s `Chat` class handles streaming UI messages, tool-call state
-transitions (`tool-input-start` → `tool-input-delta` → `tool-input-available` →
-`tool-output-available`), and exposes `status` ∈
-`{ ready, submitted, streaming, error }`.
+The Chat object holds messages in memory; an `$effect` debounces writes to
+`localStorage` (`harness.thread.<id>`). The sidebar reads the index
+(`harness.threads`) to render the thread list.
 
-The chat page renders **tool calls inline** under their assistant turn, so you
-can see what the agent is doing as it does it:
-
-```
-> compute beam deflection ...
-
-ASSISTANT
-  ╭ write_file   output-available
-  │ input:  { path: "/tmp/beam.py", content: "..." }
-  │ output: { ok: true, path: "/tmp/beam.py", bytes: 295 }
-  ╰
-  ╭ bash         output-available
-  │ input:  { command: "python3 /tmp/beam.py" }
-  │ output: { stdout: "Calculated deflection: 40.69 mm", exit: 0 }
-  ╰
-  Based on the provided specifications, the deflection is 40.69 mm…
-```
-
----
-
-## Backend in 90 seconds
-
-```mermaid
-flowchart LR
-  IDX[src/index.ts<br/>Hono + Bun.serve<br/>idleTimeout: 0]
-  HEALTH[/routes/health.ts<br/>GET /health/]
-  CHAT[/routes/chat.ts<br/>POST /chat/]
-  MODELS[ai/models.ts<br/>vertex registry]
-  PROMPT[ai/system-prompt.ts]
-  TOOLS[ai/tools.ts<br/>bash / read_file<br/>write_file / list_dir]
-  PROV[sandbox/provider.ts<br/>@kubernetes/client-node]
-
-  IDX --- HEALTH
-  IDX --- CHAT
-  CHAT --> MODELS
-  CHAT --> PROMPT
-  CHAT --> TOOLS
-  TOOLS --> PROV
-```
-
-`POST /chat` is just:
-
-```ts
-streamText({
-  model: models[modelId],
-  system: baseSystemPrompt,
-  messages: await convertToModelMessages(input.messages),
-  tools: sandboxTools(sessionId),
-  stopWhen: stepCountIs(10),
-}).toUIMessageStreamResponse()
-```
-
-`stopWhen: stepCountIs(10)` lets Gemini iterate up to 10 tool-use rounds in a
-single user turn. Without it, the agent would call one tool and stop.
+Tool calls render inline under their assistant turn so you can see what the
+agent is doing as it does it.
 
 ---
 
 ## Decisions and tradeoffs
 
-### Effect-TS scaffold but no Effect-yet
+### Why agent-sandbox / kind locally
 
-`apps/api/src/runtime.ts` exists with an empty `Layer.empty` and a
-`ManagedRuntime.make(...)`. It pays off when there's more than one service to
-compose. Right now there's only the sandbox provider, and routing a single
-service through Effect would be ceremony. **Phase D** (cortex/talos/wine2o2
-clients + skills + MCP host) is where we wire actual layers and convert the
-plain async functions to Effect services.
+`agent-sandbox` (kubernetes-sigs) gives a small, opinionated CRD surface
+(`Sandbox`, `SandboxTemplate`, `SandboxClaim`, `SandboxWarmPool`) on top of
+plain Kubernetes pods. By creating a `Sandbox` CR per chat we get pod
+lifecycle, status conditions, and a clean place to attach future features
+(warm pools, claims, templates) without rolling our own controller.
 
-### shadcn-svelte not yet
+`kind` is the simplest way to host that on a developer laptop: one Docker
+container per cluster node, ~30s cold boot, works wherever Docker works.
 
-Chat is a single view with a small set of primitives — input, scrolling list,
-select. Adding shadcn-svelte now means a tooling step (`components.json`, CLI)
-for things we could draw in 30 lines of Tailwind. We add it the moment a second
-view lands (sources/skills/MCP pages).
+### Container isolation, not micro-VM
+
+The default Sandbox pod is a stock Linux container (cgroups + namespaces).
+For stronger isolation, install [gVisor](https://gvisor.dev/) and a
+`gvisor` `RuntimeClass`, then set `SANDBOX_RUNTIME_CLASS=gvisor` —
+`provider.ts` already plumbs the runtime-class through to the pod spec.
+
+### No persistence on the server
+
+Chats live in `localStorage` under `harness.threads` (index) and
+`harness.thread.<id>` (full record with messages). Closing the tab keeps
+them; clearing site data clears them. No accounts, no shared state, no
+sync across devices. This keeps the local stack to **two processes + one
+cluster** and removes the entire auth / DB attack surface for a single-user
+demo.
+
+If you want multi-device sync or sharing later, the natural place to add
+that is a new `/threads/*` route on the API backed by Postgres + better-auth
+(see the project history for one shape that worked).
 
 ### Single shared default sessionId fallback
 
-The API accepts `sessionId` from the body; web persists one per browser. If a
-client doesn't send one, we fall back to `"default"`. That means *anyone hitting
-the API anonymously shares one pod.* Fine for solo dev, not for production —
-**every untrusted caller must get an isolated session**.
-
-### `local-docker` provider removed
-
-The original plan had a Mac-fallback `local-docker` SandboxProvider for hosts
-without nested virt. Since we proved kata works on M4 Pro, the fallback is
-dead code we didn't ship. We'll re-add it if we ever need to run the harness
-on Intel Macs or M1/M2.
+The API accepts `sessionId` from the body; the web sets one per thread. If
+a client doesn't send one, we fall back to `"default"`. Fine for solo dev,
+not for production — every untrusted caller must get an isolated session.
 
 ---
 
 ## Known limitations
 
-| Limitation | Why | Mitigation |
-|---|---|---|
-| No pod TTL / reaper | Out of scope for first cut | `kubectl -n harness-sandboxes delete pods --all` |
-| ~~`kubectl` shellout overhead~~ | resolved — apps/api runs on Node with `@kubernetes/client-node` direct exec | |
-| No persistence (chat history) | No DB yet | Phase D adds Drizzle + cortex sessions |
-| Tool output is JSON-dumped in UI | No per-tool renderer | Custom renderers when shadcn-svelte lands |
-| `setup.sh` not idempotent across kata-deploy v2-vs-v3 schema regressions | Each kata-deploy restart re-writes its drop-in (we don't use it, but it's noise) | Document; the symlink hack is in `infra/kata/README.md` |
-| Recreating the Colima VM (`colima delete --data`) wipes the kata install | Volume backs all VM state | Re-run `./infra/kata/setup.sh` |
-| Only Vertex (Gemini) | Anthropic also planned | Phase D: add `@ai-sdk/anthropic` to the model registry |
-
----
-
-## What's next
-
-Roughly in order of utility:
-
-1. **Pod TTL reaper.** A background loop in `apps/api` that deletes
-   `harness-sb-*` pods idle > N minutes.
-2. **Anthropic (Claude) in the model registry.** Same pattern as Vertex,
-   different env var. The model picker UI gets two more entries.
-3. **`packages/clients`** — typed wrappers for `cortex`, `talos`, `wine2o2`.
-   Effect services with `Context.Tag` + default `Layer`.
-4. **`packages/core`** — domain services that compose the clients:
-   `Sources`, `Skills`, `Retrieve`, `Memory`. Each becomes an Effect service.
-5. **Source ingestion pipeline.** Upload PDF/URL → wine2o2 → cortex resource.
-6. **Skills CRUD UI** with cortex sync.
-7. **MCP host** — `experimental_createMCPClient` per-session for HTTP/SSE
-   transports first, stdio later via an extracted bridge service.
-8. **Org context middleware** — read `x-harness-org` from the SvelteKit BFF,
-   translate to cortex tenant headers in the api server.
-9. **shadcn-svelte init** when the second view (sources or skills) lands.
-10. **kata-qemu fallback path** for non-M3+ hosts, plus a `local-docker`
-    provider for hosts without any Linux VM.
+| Limitation | Mitigation |
+|---|---|
+| No pod TTL / reaper | `kubectl --context kind-harness-agent-sandbox -n harness-sandboxes delete sandbox --all` |
+| Tool output is JSON-dumped in UI | Add per-tool renderers when more tools land |
+| Only Vertex Gemini in the model registry | Add other providers + env keys later |
+| `localStorage` is per-browser-per-origin | Clear via devtools → Application → Local Storage |
 
 ---
 
@@ -577,21 +336,18 @@ See `AGENTS.md`. Quick highlights:
 - No `try`/`catch` unless absolutely necessary; prefer early returns.
 - No `else` — early returns instead.
 - No `any`; rely on inference.
-- Prefer Bun APIs (`Bun.file`, `Bun.spawn`).
-- Drizzle: snake_case columns, no column-name strings.
 - Effect: don't return `Effect` from synchronous helpers.
 
 ---
 
 ## Working theory of operation
 
-If you want a one-paragraph mental model: this is a **streaming function** from
-chat messages to chat messages. SvelteKit's BFF and the Hono API just shuttle
+A one-paragraph mental model: this is a **streaming function** from chat
+messages to chat messages. SvelteKit's BFF and the Hono API just shuttle
 bytes; the model lives at Vertex and decides when to "step out" by emitting
-tool calls. Each tool call resolves to a k8s `Exec` API call into a long-lived pod
-that the model owns for the duration of its session. The pod is a real
-isolated kernel running inside a real micro-VM running inside a Linux VM
-running inside macOS — five boundaries between the agent's `rm -rf /` and
-your laptop. That's the whole product surface right now; everything else
-is the path to making it more useful (memory, sources, skills, MCP) while
-keeping that core loop intact.
+tool calls. Each tool call resolves to a k8s `Exec` API call into a
+long-lived pod that the model owns for the duration of its chat. The pod is
+provisioned by the agent-sandbox controller from a `Sandbox` custom
+resource, so its lifecycle, status, and configuration are all standard
+Kubernetes objects — no bespoke controller code in this repo. Chat history
+lives in the browser, not on a server.

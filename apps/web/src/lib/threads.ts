@@ -11,54 +11,92 @@ export type Thread = {
 
 export type ThreadWithMessages = Thread & { messages: UIMessage[] }
 
-const jsonHeaders = { "content-type": "application/json" }
+// localStorage layout:
+//   harness.threads          → JSON array of Thread (no messages)
+//   harness.thread.<id>      → JSON ThreadWithMessages (full record)
 
-const handle = async <T>(r: Response): Promise<T> => {
-  if (!r.ok) {
-    const text = await r.text().catch(() => "")
-    throw new Error(text || `${r.status} ${r.statusText}`)
+const INDEX_KEY = "harness.threads"
+const threadKey = (id: string) => `harness.thread.${id}`
+
+const safeParse = <T>(raw: string | null): T | null => {
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return null
   }
-  return (await r.json()) as T
 }
 
-export const listThreads = async (): Promise<Thread[]> => {
-  const r = await fetch("/api/threads")
-  const { threads } = await handle<{ threads: Thread[] }>(r)
-  return threads
+const writeIndex = (threads: Thread[]) => {
+  localStorage.setItem(INDEX_KEY, JSON.stringify(threads))
 }
 
-export const createThread = async (model: string): Promise<ThreadWithMessages> => {
-  const r = await fetch("/api/threads", {
-    method: "POST",
-    headers: jsonHeaders,
-    body: JSON.stringify({ model }),
-  })
-  const { thread } = await handle<{ thread: ThreadWithMessages }>(r)
-  return thread
+const writeFull = (full: ThreadWithMessages) => {
+  localStorage.setItem(threadKey(full.id), JSON.stringify(full))
 }
 
-export const getThread = async (id: string): Promise<ThreadWithMessages> => {
-  const r = await fetch(`/api/threads/${id}`)
-  const { thread } = await handle<{ thread: ThreadWithMessages }>(r)
-  return thread
+const newId = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2) + Date.now().toString(36)
+
+const summarize = (full: ThreadWithMessages): Thread => ({
+  id: full.id,
+  title: full.title,
+  sandbox_session_id: full.sandbox_session_id,
+  model: full.model,
+  created_at: full.created_at,
+  updated_at: full.updated_at,
+})
+
+export const listThreads = (): Thread[] => {
+  const arr = safeParse<Thread[]>(localStorage.getItem(INDEX_KEY)) ?? []
+  return [...arr].sort((a, b) => b.updated_at - a.updated_at)
 }
 
-export const updateThread = async (
+export const createThread = (model: string): ThreadWithMessages => {
+  const now = Date.now()
+  const full: ThreadWithMessages = {
+    id: newId(),
+    title: "New chat",
+    sandbox_session_id: newId(),
+    model,
+    created_at: now,
+    updated_at: now,
+    messages: [],
+  }
+  const index = listThreads()
+  writeIndex([summarize(full), ...index])
+  writeFull(full)
+  return full
+}
+
+export const getThread = (id: string): ThreadWithMessages | null =>
+  safeParse<ThreadWithMessages>(localStorage.getItem(threadKey(id)))
+
+export const updateThread = (
   id: string,
   patch: { title?: string; model?: string; messages?: UIMessage[] },
-): Promise<ThreadWithMessages> => {
-  const r = await fetch(`/api/threads/${id}`, {
-    method: "PUT",
-    headers: jsonHeaders,
-    body: JSON.stringify(patch),
-  })
-  const { thread } = await handle<{ thread: ThreadWithMessages }>(r)
-  return thread
+): ThreadWithMessages | null => {
+  const current = getThread(id)
+  if (!current) return null
+  const next: ThreadWithMessages = {
+    ...current,
+    title: patch.title ?? current.title,
+    model: patch.model ?? current.model,
+    messages: patch.messages ?? current.messages,
+    updated_at: Date.now(),
+  }
+  writeFull(next)
+  const index = listThreads().map((t) => (t.id === id ? summarize(next) : t))
+  writeIndex(index)
+  return next
 }
 
-export const deleteThread = async (id: string): Promise<void> => {
-  const r = await fetch(`/api/threads/${id}`, { method: "DELETE" })
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`)
+export const deleteThread = (id: string) => {
+  localStorage.removeItem(threadKey(id))
+  const index = listThreads().filter((t) => t.id !== id)
+  writeIndex(index)
 }
 
 export const titleFromMessages = (messages: UIMessage[]): string | null => {

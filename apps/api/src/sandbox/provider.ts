@@ -2,9 +2,9 @@ import * as k8s from "@kubernetes/client-node"
 import { Writable, Readable } from "node:stream"
 import { guessMime, isTextLike, isImage } from "./mime"
 
-const NS = process.env.KATA_NAMESPACE ?? "harness-sandboxes"
-const CONTEXT = process.env.KATA_CONTEXT ?? "colima-harness"
-const RUNTIME_CLASS = process.env.KATA_RUNTIME_CLASS ?? "kata-clh"
+const NS = process.env.SANDBOX_NAMESPACE ?? "harness-sandboxes"
+const CONTEXT = process.env.SANDBOX_CONTEXT ?? "kind-harness-agent-sandbox"
+const RUNTIME_CLASS = process.env.SANDBOX_RUNTIME_CLASS
 const IMAGE = process.env.SANDBOX_IMAGE ?? "harness-sandbox:1"
 const IMAGE_PULL_POLICY = process.env.SANDBOX_IMAGE_PULL_POLICY ?? "IfNotPresent"
 const CONTAINER = "shell"
@@ -12,16 +12,23 @@ const UPLOAD_DIR = "/workspace/uploads"
 const ALLOWED_ROOT = "/workspace"
 const MAX_BYTES = 256 * 1024
 
+const SANDBOX_GROUP = "agents.x-k8s.io"
+const SANDBOX_VERSION = "v1alpha1"
+const SANDBOX_PLURAL = "sandboxes"
+
 const kc = new k8s.KubeConfig()
 kc.loadFromDefault()
 kc.setCurrentContext(CONTEXT)
 
 const core = kc.makeApiClient(k8s.CoreV1Api)
+const cuapi = kc.makeApiClient(k8s.CustomObjectsApi)
 const execApi = new k8s.Exec(kc)
 
 const ready = new Map<string, Promise<void>>()
 
-const podName = (sessionId: string) =>
+// Sandbox name doubles as the pod name created by the agent-sandbox controller,
+// so exec uses this directly.
+const sandboxName = (sessionId: string) =>
   "harness-sb-" + sessionId.replace(/[^a-z0-9-]/gi, "").toLowerCase().slice(0, 40)
 
 const sanitizeFilename = (name: string) => {
@@ -51,51 +58,86 @@ const ensureNamespace = async () => {
   }
 }
 
-const podSpec = (sessionId: string): k8s.V1Pod => ({
-  apiVersion: "v1",
-  kind: "Pod",
+type SandboxCondition = {
+  type: string
+  status: string
+  reason?: string
+  message?: string
+}
+
+type SandboxCR = {
+  metadata?: { name?: string }
+  status?: { conditions?: SandboxCondition[] }
+}
+
+const isReady = (cr: SandboxCR | undefined) =>
+  cr?.status?.conditions?.some((c) => c.type === "Ready" && c.status === "True") ?? false
+
+const sandboxBody = (sessionId: string) => ({
+  apiVersion: `${SANDBOX_GROUP}/${SANDBOX_VERSION}`,
+  kind: "Sandbox",
   metadata: {
-    name: podName(sessionId),
+    name: sandboxName(sessionId),
     namespace: NS,
     labels: { "app.kubernetes.io/name": "harness-sandbox", "harness.io/session": sessionId },
   },
   spec: {
-    runtimeClassName: RUNTIME_CLASS,
-    restartPolicy: "Never",
-    terminationGracePeriodSeconds: 5,
-    containers: [
-      {
-        name: CONTAINER,
-        image: IMAGE,
-        imagePullPolicy: IMAGE_PULL_POLICY,
-        command: ["/bin/sh", "-c", "sleep infinity"],
-        workingDir: "/workspace",
-        resources: {
-          limits: { cpu: "2", memory: "2Gi" },
-          requests: { cpu: "200m", memory: "512Mi" },
-        },
+    podTemplate: {
+      spec: {
+        ...(RUNTIME_CLASS ? { runtimeClassName: RUNTIME_CLASS } : {}),
+        restartPolicy: "Never",
+        terminationGracePeriodSeconds: 5,
+        containers: [
+          {
+            name: CONTAINER,
+            image: IMAGE,
+            imagePullPolicy: IMAGE_PULL_POLICY,
+            command: ["/bin/sh", "-c", "sleep infinity"],
+            workingDir: "/workspace",
+            resources: {
+              limits: { cpu: "2", memory: "2Gi" },
+              requests: { cpu: "200m", memory: "512Mi" },
+            },
+          },
+        ],
       },
-    ],
+    },
   },
 })
 
-const ensurePod = async (sessionId: string) => {
-  const name = podName(sessionId)
+const getSandbox = async (name: string): Promise<SandboxCR> => {
+  const cr = (await cuapi.getNamespacedCustomObject({
+    group: SANDBOX_GROUP,
+    version: SANDBOX_VERSION,
+    namespace: NS,
+    plural: SANDBOX_PLURAL,
+    name,
+  })) as SandboxCR
+  return cr
+}
+
+const ensureSandbox = async (sessionId: string) => {
+  const name = sandboxName(sessionId)
   try {
-    const pod = await core.readNamespacedPod({ name, namespace: NS })
-    if (pod.status?.phase === "Running") return
+    const cr = await getSandbox(name)
+    if (isReady(cr)) return
   } catch (e) {
     if (!isStatus404(e)) throw e
-    await core.createNamespacedPod({ namespace: NS, body: podSpec(sessionId) })
+    await cuapi.createNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: NS,
+      plural: SANDBOX_PLURAL,
+      body: sandboxBody(sessionId),
+    })
   }
   const deadline = Date.now() + 90_000
   while (Date.now() < deadline) {
-    const pod = await core.readNamespacedPod({ name, namespace: NS })
-    if (pod.status?.phase === "Running") return
-    if (pod.status?.phase === "Failed") throw new Error(`pod failed: ${pod.status?.message ?? ""}`)
+    const cr = await getSandbox(name)
+    if (isReady(cr)) return
     await new Promise((r) => setTimeout(r, 500))
   }
-  throw new Error("sandbox pod did not become Running within 90s")
+  throw new Error("sandbox did not become Ready within 90s")
 }
 
 const acquire = async (sessionId: string) => {
@@ -103,7 +145,7 @@ const acquire = async (sessionId: string) => {
   if (existing) return existing
   const p = (async () => {
     await ensureNamespace()
-    await ensurePod(sessionId)
+    await ensureSandbox(sessionId)
   })()
   ready.set(sessionId, p)
   try {
@@ -152,7 +194,7 @@ const rawExec = async (
     : null
   return new Promise<RawResult>((resolve, reject) => {
     execApi
-      .exec(NS, podName(sessionId), CONTAINER, command, out, err, stdinStream, false, (status) => {
+      .exec(NS, sandboxName(sessionId), CONTAINER, command, out, err, stdinStream, false, (status) => {
         resolve({
           stdout: Buffer.concat(stdoutChunks).toString("utf8"),
           stderr: Buffer.concat(stderrChunks).toString("utf8"),
@@ -295,7 +337,7 @@ export const downloadFile = async (
         },
       })
       execApi
-        .exec(NS, podName(sessionId), CONTAINER, ["/bin/cat", path], out, err, null, false, (status) => {
+        .exec(NS, sandboxName(sessionId), CONTAINER, ["/bin/cat", path], out, err, null, false, (status) => {
           if (status && status.status !== "Success") controller.error(new Error(status.message ?? "download failed"))
           else controller.close()
         })
@@ -342,7 +384,13 @@ export const attachFile = async (
 
 export const release = async (sessionId: string) => {
   try {
-    await core.deleteNamespacedPod({ name: podName(sessionId), namespace: NS })
+    await cuapi.deleteNamespacedCustomObject({
+      group: SANDBOX_GROUP,
+      version: SANDBOX_VERSION,
+      namespace: NS,
+      plural: SANDBOX_PLURAL,
+      name: sandboxName(sessionId),
+    })
   } catch (e) {
     if (!isStatus404(e)) throw e
   }
