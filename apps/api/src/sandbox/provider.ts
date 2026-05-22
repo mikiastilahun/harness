@@ -3,9 +3,13 @@ import { Writable, Readable } from "node:stream"
 import { guessMime, isTextLike, isImage } from "./mime"
 
 const NS = process.env.SANDBOX_NAMESPACE ?? "harness-sandboxes"
-const CONTEXT = process.env.SANDBOX_CONTEXT ?? "kind-harness-agent-sandbox"
+const CONTEXT =
+  process.env.SANDBOX_CONTEXT ??
+  "gke_qa1-us-central1-vpc-63b3e2_us-central1_qa1-us-central1-services"
 const RUNTIME_CLASS = process.env.SANDBOX_RUNTIME_CLASS
-const IMAGE = process.env.SANDBOX_IMAGE ?? "harness-sandbox:1"
+const IMAGE =
+  process.env.SANDBOX_IMAGE ??
+  "us-docker.pkg.dev/mgmt-us-central1-vpc-a2cc50/apps/harness-sandbox:1"
 const IMAGE_PULL_POLICY = process.env.SANDBOX_IMAGE_PULL_POLICY ?? "IfNotPresent"
 const CONTAINER = "shell"
 const UPLOAD_DIR = "/workspace/uploads"

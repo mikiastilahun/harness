@@ -1,53 +1,103 @@
-# agent-sandbox (local, kind)
+# agent-sandbox
 
-Runs the upstream [`agent-sandbox`](https://agent-sandbox.sigs.k8s.io/)
-controller on a local [kind](https://kind.sigs.k8s.io/) cluster
-(Kubernetes-in-Docker). Each chat session in the harness gets its own pod
-through a `Sandbox` custom resource. Works on any host with Docker and kind
-installed.
+Sandbox runtime for the harness API: each session gets a pod managed by the
+upstream [`agent-sandbox`](https://agent-sandbox.sigs.k8s.io/) controller.
+The provider in `apps/api/src/sandbox/provider.ts` creates/deletes `Sandbox`
+custom resources; the controller materializes them as pods we `exec` into.
 
-## One-time setup
+Two ways to run the controller:
+
+| | qa1 GKE (default) | local kind |
+|---|---|---|
+| Cluster | `qa1-us-central1-services` (project `qa1-us-central1-vpc-63b3e2`) | `kind` (docker container) |
+| Context | `gke_qa1-us-central1-vpc-63b3e2_us-central1_qa1-us-central1-services` | `kind-harness-agent-sandbox` |
+| Sandbox image | `us-docker.pkg.dev/mgmt-us-central1-vpc-a2cc50/apps/harness-sandbox:1` (mgmt apps repo) | `harness-sandbox:1` (local; `kind load`) |
+| Controller install | ACM ConfigSync from `infrastructure/acm/config-root/qa1-us-central1/agent-sandbox/` | `./infra/agent-sandbox/setup.sh` |
+| Use case | shared dev / staging | hacking offline |
+
+## qa1 GKE (default)
+
+The controller, its CRDs, and the `harness-sandboxes` namespace are managed by
+ConfigSync via the infrastructure repo. To use the cluster:
 
 ```sh
-./infra/agent-sandbox/setup.sh
+gcloud container clusters get-credentials qa1-us-central1-services \
+  --region us-central1 --project qa1-us-central1-vpc-63b3e2
+
+# .env already points here by default.
+pnpm dev
 ```
 
-Idempotent. Provisions:
-
-1. `kind` cluster named `harness-agent-sandbox` (override with `KIND_CLUSTER=`).
-2. `agent-sandbox` controller + CRDs (pinned to `v0.4.6` —
-   override with `AGENT_SANDBOX_VERSION=`).
-3. Extensions (`SandboxTemplate`, etc.).
-4. Builds `infra/sandbox/Dockerfile` as `harness-sandbox:1` and `kind load`s
-   it into the cluster, so the default `SANDBOX_IMAGE` works without a
-   registry.
-5. Smoke test: applies a hello-world `Sandbox` CR running `alpine`, prints
-   its logs, deletes it.
-
-## Every-boot
+Sanity-check the controller:
 
 ```sh
-pnpm sandbox:up    # docker start <node-container> + wait for controller
+CTX=gke_qa1-us-central1-vpc-63b3e2_us-central1_qa1-us-central1-services
+kubectl --context $CTX -n agent-sandbox-system get pods
+kubectl --context $CTX -n harness-sandboxes get sandboxes
 ```
 
-kind nodes are just docker containers. Stopping Docker stops the cluster;
-restarting Docker leaves it stopped until `sandbox:up` brings it back.
+### Rebuilding the sandbox image
 
-## Teardown
+The sandbox image lives in the shared mgmt `apps` Artifact Registry; the qa1
+node service account already has `roles/artifactregistry.reader` on it (managed
+by Terramate in
+`stacks/mgmt-us-central1/mgmt-us-central1-vpc/artifact-registry/stack.tm.hcl`).
+No imagePullSecret required.
 
 ```sh
-pnpm sandbox:down                            # stop the node container (state persists)
-kind delete cluster --name harness-agent-sandbox   # fully wipe
+gcloud auth configure-docker us-docker.pkg.dev  # one-time
+
+docker buildx build --platform linux/amd64 --provenance=false --push \
+  -t us-docker.pkg.dev/mgmt-us-central1-vpc-a2cc50/apps/harness-sandbox:1 \
+  -t us-docker.pkg.dev/mgmt-us-central1-vpc-a2cc50/apps/harness-sandbox:latest \
+  infra/sandbox
 ```
 
-## Try it
+### Bumping the controller version
+
+Manifests are vendored at
+`infrastructure/acm/config-root/qa1-us-central1/agent-sandbox/`. To bump:
 
 ```sh
-kubectl --context kind-harness-agent-sandbox apply -f - <<'YAML'
+cd infrastructure/acm/config-root/qa1-us-central1/agent-sandbox
+V=v0.4.7
+curl -fsSL -o manifest.yaml   https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$V/manifest.yaml
+curl -fsSL -o extensions.yaml https://github.com/kubernetes-sigs/agent-sandbox/releases/download/$V/extensions.yaml
+# Then drop the controller Deployment from manifest.yaml — extensions.yaml's
+# copy (the one with --extensions) is the authoritative one. See the comment in
+# kustomization.yaml.
+kubectl kustomize . > /dev/null  # validates build
+```
+
+Commit + push the infrastructure repo; ConfigSync reconciles within a minute.
+
+## Local kind (offline dev)
+
+```sh
+./infra/agent-sandbox/setup.sh    # one-shot: kind cluster + controller + CRDs + smoke test
+pnpm sandbox:up                   # every boot: docker start of the kind node
+pnpm sandbox:down                 # docker stop
+```
+
+Override these in `.env` to point the API at the local cluster:
+
+```sh
+SANDBOX_CONTEXT=kind-harness-agent-sandbox
+SANDBOX_IMAGE=harness-sandbox:1
+```
+
+`setup.sh` builds `infra/sandbox/Dockerfile` as `harness-sandbox:1` and
+`kind load`s it into the cluster, so the local default works without a registry.
+
+## Try it (either backend)
+
+```sh
+kubectl --context "$SANDBOX_CONTEXT" apply -f - <<'YAML'
 apiVersion: agents.x-k8s.io/v1alpha1
 kind: Sandbox
 metadata:
   name: scratch
+  namespace: harness-sandboxes
 spec:
   podTemplate:
     spec:
@@ -58,37 +108,14 @@ spec:
       restartPolicy: Never
 YAML
 
-kubectl --context kind-harness-agent-sandbox exec -it scratch -c shell -- bash
-```
-
-## Optional: Python SDK pieces
-
-The upstream install docs also include a `sandbox-router` deployment and a
-`python-sandbox-template` for use with the Python client SDK. We don't install
-them by default because the harness is TypeScript. To add them:
-
-```sh
-VERSION=v0.4.6
-SANDBOX_NAMESPACE=default
-SANDBOX_TEMPLATE_NAME=python-sandbox
-
-# router
-curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/refs/tags/${VERSION}/clients/python/agentic-sandbox-client/sandbox-router/sandbox_router.yaml" \
-  | sed 's|${ROUTER_IMAGE}|us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/sandbox-router:latest-main|g' \
-  | kubectl --context kind-harness-agent-sandbox apply -f -
-
-# template
-curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/agent-sandbox/refs/tags/${VERSION}/clients/python/agentic-sandbox-client/python-sandbox-template.yaml" \
-  | sed -e "s|\${SANDBOX_NAMESPACE}|${SANDBOX_NAMESPACE}|g" \
-        -e "s|\${SANDBOX_TEMPLATE_NAME}|${SANDBOX_TEMPLATE_NAME}|g" \
-  | kubectl --context kind-harness-agent-sandbox apply -f -
+kubectl --context "$SANDBOX_CONTEXT" -n harness-sandboxes exec -it scratch -c shell -- bash
+kubectl --context "$SANDBOX_CONTEXT" -n harness-sandboxes delete sandbox scratch
 ```
 
 ## Notes
 
-- `apps/api/src/sandbox/provider.ts` creates `Sandbox` CRs in this cluster by
-  default (`SANDBOX_CONTEXT=kind-harness-agent-sandbox`,
-  `SANDBOX_NAMESPACE=harness-sandboxes`).
-- `kind` images are kubernetes-version-tagged. Override with `--image` on
-  `kind create cluster` if you need a specific k8s version; the default tracks
-  the kind release.
+- The provider creates `Sandbox` CRs at runtime in `harness-sandboxes`; only
+  the namespace itself is in ACM, not individual sandboxes.
+- Optional `SANDBOX_RUNTIME_CLASS=kata-clh|gvisor` if you've installed those
+  runtimes. Stock GKE only ships gVisor on sandbox-enabled node pools — leave
+  unset for now.

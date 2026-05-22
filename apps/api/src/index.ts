@@ -5,6 +5,7 @@ import { serve } from "@hono/node-server"
 import { health } from "./routes/health"
 import { chat } from "./routes/chat"
 import { sandbox } from "./routes/sandbox"
+import { skills } from "./routes/skills"
 
 const webOrigin = process.env.WEB_URL ?? "http://localhost:5173"
 
@@ -21,6 +22,7 @@ const app = new Hono()
   .route("/health", health)
   .route("/chat", chat)
   .route("/sandbox", sandbox)
+  .route("/skills", skills)
 
 const port = Number(process.env.API_PORT ?? 8787)
 

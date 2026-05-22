@@ -1,10 +1,12 @@
 import type { UIMessage } from "ai"
+import type { AttachedSkill } from "./skills"
 
 export type Thread = {
   id: string
   title: string
   sandbox_session_id: string
   model: string
+  skills: AttachedSkill[]
   created_at: number
   updated_at: number
 }
@@ -45,13 +47,17 @@ const summarize = (full: ThreadWithMessages): Thread => ({
   title: full.title,
   sandbox_session_id: full.sandbox_session_id,
   model: full.model,
+  skills: full.skills,
   created_at: full.created_at,
   updated_at: full.updated_at,
 })
 
 export const listThreads = (): Thread[] => {
   const arr = safeParse<Thread[]>(localStorage.getItem(INDEX_KEY)) ?? []
-  return [...arr].sort((a, b) => b.updated_at - a.updated_at)
+  // Migrate older records that predate `skills`.
+  return arr
+    .map((t) => ({ ...t, skills: t.skills ?? [] }))
+    .sort((a, b) => b.updated_at - a.updated_at)
 }
 
 export const createThread = (model: string): ThreadWithMessages => {
@@ -61,6 +67,7 @@ export const createThread = (model: string): ThreadWithMessages => {
     title: "New chat",
     sandbox_session_id: newId(),
     model,
+    skills: [],
     created_at: now,
     updated_at: now,
     messages: [],
@@ -71,12 +78,15 @@ export const createThread = (model: string): ThreadWithMessages => {
   return full
 }
 
-export const getThread = (id: string): ThreadWithMessages | null =>
-  safeParse<ThreadWithMessages>(localStorage.getItem(threadKey(id)))
+export const getThread = (id: string): ThreadWithMessages | null => {
+  const raw = safeParse<ThreadWithMessages>(localStorage.getItem(threadKey(id)))
+  if (!raw) return null
+  return { ...raw, skills: raw.skills ?? [] }
+}
 
 export const updateThread = (
   id: string,
-  patch: { title?: string; model?: string; messages?: UIMessage[] },
+  patch: { title?: string; model?: string; messages?: UIMessage[]; skills?: AttachedSkill[] },
 ): ThreadWithMessages | null => {
   const current = getThread(id)
   if (!current) return null
@@ -85,6 +95,7 @@ export const updateThread = (
     title: patch.title ?? current.title,
     model: patch.model ?? current.model,
     messages: patch.messages ?? current.messages,
+    skills: patch.skills ?? current.skills,
     updated_at: Date.now(),
   }
   writeFull(next)

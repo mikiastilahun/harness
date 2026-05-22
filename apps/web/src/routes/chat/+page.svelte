@@ -7,6 +7,7 @@
   import { Button } from "$lib/components/ui/button"
   import { ScrollArea } from "$lib/components/ui/scroll-area"
   import ModelPicker from "$lib/components/chat/ModelPicker.svelte"
+  import SkillsPicker from "$lib/components/chat/SkillsPicker.svelte"
   import { Toaster } from "$lib/components/ui/sonner"
   import { toast } from "svelte-sonner"
   import Sidebar from "$lib/components/chat/Sidebar.svelte"
@@ -30,6 +31,7 @@
     titleFromMessages,
   } from "$lib/threads"
   import { DEFAULT_MODEL, isValidModel } from "$lib/models"
+  import type { AttachedSkill } from "$lib/skills"
 
   const SAVE_DEBOUNCE_MS = 800
 
@@ -50,7 +52,22 @@
       messages: initial,
       transport: new DefaultChatTransport({
         api: "/api/chat",
-        body: () => ({ model: t.model, sessionId: t.sandbox_session_id }),
+        body: () => {
+          // Read latest skills snapshot from the threads state at send-time,
+          // not from the closure (so adds/removes mid-thread take effect).
+          const live = threads.find((x) => x.id === t.id) ?? t
+          return {
+            model: live.model,
+            sessionId: live.sandbox_session_id,
+            skills: live.skills.map((s) => ({
+              id: s.id,
+              source: s.source,
+              skillId: s.skillId,
+              name: s.name,
+              description: s.description,
+            })),
+          }
+        },
       }),
       onError: (e) => toast.error(e.message),
     })
@@ -119,6 +136,27 @@
       .sort((a, b) => b.updated_at - a.updated_at)
     const t = threads.find((x) => x.id === updated.id)
     if (chat && t) chat = makeChat(t, chat.messages)
+  }
+
+  const addSkill = (skill: AttachedSkill) => {
+    if (!active) return
+    if (active.skills.some((s) => s.id === skill.id)) return
+    const next = [...active.skills, skill]
+    const updated = updateThread(active.id, { skills: next })
+    if (!updated) return
+    threads = threads.map((t) =>
+      t.id === updated.id ? { ...t, skills: updated.skills, updated_at: updated.updated_at } : t,
+    )
+  }
+
+  const removeSkill = (id: string) => {
+    if (!active) return
+    const next = active.skills.filter((s) => s.id !== id)
+    const updated = updateThread(active.id, { skills: next })
+    if (!updated) return
+    threads = threads.map((t) =>
+      t.id === updated.id ? { ...t, skills: updated.skills, updated_at: updated.updated_at } : t,
+    )
   }
 
   onMount(() => {
@@ -215,6 +253,9 @@
         {/if}
       </div>
       <div class="flex items-center gap-2">
+        {#if active}
+          <SkillsPicker skills={active.skills} onAdd={addSkill} onRemove={removeSkill} />
+        {/if}
         <ModelPicker value={currentModel} onSelect={changeModel} />
         <Button
           size="icon"
